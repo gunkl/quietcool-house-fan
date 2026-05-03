@@ -77,6 +77,7 @@ namespace esphome {
           this->send_command(FAN_ON);
         } else {
           this->send_command(FAN_OFF);
+          this->speed = 0;
         }
 
         this->state = call.get_state().value();
