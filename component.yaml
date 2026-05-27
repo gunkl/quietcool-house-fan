@@ -12,8 +12,8 @@ logger:
 
 globals:
   - id: remote_id
+    type: 'uint8_t[4]'
     restore_value: true
-    type: 'std::vector<uint8_t>'
 #
 # Change these values to your remote's ID. If you don't know your ID, open up the ESPHome
 # logger and push any button on your remote (if you just wake up your remote it should 
@@ -34,8 +34,8 @@ globals:
 
 
   - id: autoset_remote
-    restore_value: true
     type: bool
+    restore_value: true
 # 
 # If you can't view the logs or don't want to, you can have this module learn the remote ID
 # when it starts up. To do that, set this value to "true" and then shortly after your ESP
@@ -75,7 +75,7 @@ cc1101:
 
           if (id(autoset_remote)) {
             std::vector<uint8_t> rcvd_remote_id(x.begin(), x.begin()+4);
-            id(remote_id) = rcvd_remote_id;
+            memcpy(id(remote_id), rcvd_remote_id.data(), 4);
             id(autoset_remote) = false;
           }
 
@@ -87,21 +87,21 @@ script:
     then:
       - cc1101.send_packet:
           data: !lambda |-
-            std::vector<uint8_t> packet(id(remote_id));
+            std::vector<uint8_t> packet(id(remote_id), id(remote_id)+4);
             packet.push_back(command);
             packet.push_back(command);
             return packet;
       - delay: 70ms
       - cc1101.send_packet:
           data: !lambda |-
-            std::vector<uint8_t> packet(id(remote_id));
+            std::vector<uint8_t> packet(id(remote_id), id(remote_id)+4);
             packet.push_back(command);
             packet.push_back(command);
             return packet;
       - delay: 70ms
       - cc1101.send_packet:
           data: !lambda |-
-            std::vector<uint8_t> packet(id(remote_id));
+            std::vector<uint8_t> packet(id(remote_id), id(remote_id)+4);
             packet.push_back(command);
             packet.push_back(command);
             return packet;
@@ -118,6 +118,7 @@ fan:
   - platform: template
     name: "quietcool whole house fan"
     speed_count: 2
+    restore_mode: RESTORE_DEFAULT_OFF
     on_turn_on:
       - script.execute:
           id: send_command
