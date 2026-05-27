@@ -2,10 +2,6 @@ esphome:
   name: house-fan
   friendly_name: house fan
 
-  libraries:
-    - SPI
-    - mfurga/CC1101
-
 esp32:
   variant: esp32s3
   framework:
@@ -14,16 +10,142 @@ esp32:
 logger:
   level: DEBUG
 
-external_components:
-  source: ./components
+globals:
+  - id: remote_id
+    restore_value: true
+    type: 'std::vector<uint8_t>'
+#
+# Change these values to your remote's ID. If you don't know your ID, open up the ESPHome
+# logger and push any button on your remote (if you just wake up your remote it should 
+# send the command "0x66" which is the wakeup command). In the logs you'll see something 
+# like this entry:
+#
+# [15:59:14.560][D][quietcool-fan:060]: Remote command received: 0x66
+# [15:59:14.560][D][quietcool-fan:061]:          from remote ID: [0xcb, 0x00, 0xa0, 0xcf]
+#
+# Copy the values inside the square brackets and paste them here (note the logs have square
+# brackets and this needs curly). 
+#
+# Note that you should be able to put your fan in pairing mode and then tell ESPHome to turn
+# it on which should make it learn whatever default code is here. You should be able to but
+# I haven't tested it because my fan is hard to get to.
+#
+    initial_value: '{0xcb, 0x00, 0xd5, 0x12}'
+
+
+  - id: autoset_remote
+    restore_value: true
+    type: bool
+# 
+# If you can't view the logs or don't want to, you can have this module learn the remote ID
+# when it starts up. To do that, set this value to "true" and then shortly after your ESP
+# boots, press a button on your remote (or just wake it). The ESP will then retain that ID
+# as long as it has power (it should try to retain it after a power outage, but it's not
+# a guarantee and I'm not sure what will happen during software updates).
+#
+    initial_value: 'false'
+
+# Set these pin numbers to the ESP32 pins corresponding to how you wired up your CC1101
+# chip. If you used the default SPI pins you might only need to set the two in the cc1101
+# section, but it doesn't hurt to be explicit.
+spi:
+  clk_pin: 18
+  mosi_pin: 6
+  miso_pin: 16
+
+cc1101:
+  cs_pin: 4
+  gdo0_pin: 3
+
+
+  modulation_type: 2-FSK
+  symbol_rate: 2400
+  fsk_deviation: 10kHz
+  packet_mode: True
+  packet_length: 0
+  sync_mode: 16/16
+  sync0: 0xd4
+  sync1: 0x2d
+  num_preamble: 4
+  on_packet:
+    then:
+      - lambda: |-
+          ESP_LOGD("quietcool-fan", "Remote command received: 0x%02x", x[4]);
+          ESP_LOGD("quietcool-fan", "         from remote ID: [0x%02x, 0x%02x, 0x%02x, 0x%02x]", x[0], x[1], x[2], x[3]);
+
+          if (id(autoset_remote)) {
+            std::vector<uint8_t> rcvd_remote_id(x.begin(), x.begin()+4);
+            id(remote_id) = rcvd_remote_id;
+            id(autoset_remote) = false;
+          }
+
+script:
+  - id: send_command
+    mode: queued
+    parameters:
+      command: int
+    then:
+      - cc1101.send_packet:
+          data: !lambda |-
+            std::vector<uint8_t> packet(id(remote_id));
+            packet.push_back(command);
+            packet.push_back(command);
+            return packet;
+      - delay: 70ms
+      - cc1101.send_packet:
+          data: !lambda |-
+            std::vector<uint8_t> packet(id(remote_id));
+            packet.push_back(command);
+            packet.push_back(command);
+            return packet;
+      - delay: 70ms
+      - cc1101.send_packet:
+          data: !lambda |-
+            std::vector<uint8_t> packet(id(remote_id));
+            packet.push_back(command);
+            packet.push_back(command);
+            return packet;
+      - logger.log:
+          format: "Sent command 0x%02x from ID [0x%02x, 0x%02x, 0x%02x, 0x%02x]"
+          args:
+            - command
+            - id(remote_id)[0]
+            - id(remote_id)[1]
+            - id(remote_id)[2]
+            - id(remote_id)[3]
 
 fan:
-  - platform: quietcool_house_fan
-    name: QuietCool Whole House Fan
-    clk_pin: 18
-    mosi_pin: 6
-    miso_pin: 16
-    cs_pin: 4
-    gdo0_pin: 3
-    gdo2_pin: 15
-    remote_id: [ 0x2d, 0xd4, 0x06, 0xcb, 0x00, 0xd5, 0x12 ]
+  - platform: template
+    name: "quietcool whole house fan"
+    speed_count: 2
+    on_turn_on:
+      - script.execute:
+          id: send_command
+          command: 0xbf
+    on_turn_off: 
+      - script.execute:
+          id: send_command
+          command: 0x80
+    on_speed_set:
+      - if:
+          condition:
+            lambda: !lambda 'return x == 0;'
+          then:
+            - script.execute:
+                id: send_command
+                command: 0x80
+      - if:
+          condition:
+            lambda: !lambda 'return x == 1;'
+          then:
+            - script.execute:
+                id: send_command
+                command: 0x1f
+      - if:
+          condition:
+            lambda: !lambda 'return x == 2;'
+          then:
+            - script.execute:
+                id: send_command
+                command: 0x3f
+
