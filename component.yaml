@@ -2,7 +2,8 @@ globals:
   - id: remote_id
     type: 'uint8_t[4]'
     restore_value: true
-#
+
+####################################################################################################
 # Change these values to your remote's ID. If you don't know your ID, open up the ESPHome
 # logger and push any button on your remote (if you just wake up your remote it should 
 # send the command "0x66" which is the wakeup command). In the logs you'll see something 
@@ -17,25 +18,28 @@ globals:
 # Note that you should be able to put your fan in pairing mode and then tell ESPHome to turn
 # it on which should make it learn whatever default code is here. You should be able to but
 # I haven't tested it because my fan is hard to get to.
-#
+####################################################################################################
     initial_value: '{0xcb, 0x00, 0xd5, 0x12}'
 
 
   - id: autoset_remote
     type: bool
     restore_value: true
-# 
+
+####################################################################################################
 # If you can't view the logs or don't want to, you can have this module learn the remote ID
 # when it starts up. To do that, set this value to "true" and then shortly after your ESP
 # boots, press a button on your remote (or just wake it). The ESP will then retain that ID
 # as long as it has power (it should try to retain it after a power outage, but it's not
 # a guarantee and I'm not sure what will happen during software updates).
-#
+####################################################################################################
     initial_value: 'false'
 
+####################################################################################################
 # Set these pin numbers to the ESP32 pins corresponding to how you wired up your CC1101
 # chip. If you used the default SPI pins you might only need to set the two in the cc1101
 # section, but it doesn't hurt to be explicit.
+####################################################################################################
 spi:
   clk_pin: 18
   mosi_pin: 6
@@ -45,7 +49,10 @@ cc1101:
   cs_pin: 4
   gdo0_pin: 3
 
-
+####################################################################################################
+# You shouldn't need to change anything below this line. See the README if you want details
+# on how the protocol works.
+####################################################################################################
   modulation_type: 2-FSK
   symbol_rate: 2400
   fsk_deviation: 10kHz
