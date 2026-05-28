@@ -27,7 +27,7 @@ The following are the transmit settings for the signals:
 | Parameter         | Value             | Notes                                                             |
 |-------------------|-------------------|-------------------------------------------------------------------|
 | Modulation        | 2-FSK             |                                                                   |
-| Data rate         | 2400bps           | Recordings have it to 2390 but 2400 works                         |
+| Data rate         | 2400bps           |                                                                   |
 | Packet mode       | Variable length   | All commands have 6 bytes of data but use variable length format  |
 | Sync mode         | 16/16             | Two-byte sync word                                                |
 | Sync word         | 0x2d 0xd4         |                                                                   |
@@ -40,7 +40,7 @@ The following are the transmit settings for the signals:
 | Start             | 8 (ish)       | 0x55                                                      |
 | Preamble          | 64            | 10101010...                                               |
 | Sync word         | 16            | 0x2D 0xD4                                                 |
-| Length            | 8             | 6                                                         |
+| Length            | 8             | 6 (number of bytes in data payload (Remote ID + Command)  |
 | Remote ID         | 32            | 0xCB 0x00 0xD5 0x12                                       |
 | Command           | 8             | 0xBF                                                      |
 | Command Repeat    | 8             | 0xBF                                                      |
@@ -49,10 +49,39 @@ Each packet is sent 3 times, separated by 70ms. The command codes are:
 
 | Command   | Value   |
 |-----------|---------|
-| Wake      | 66      |
-| On        | bf      |
-| Off       | 80      |
-| Low       | 1f      |
-| High      | 3f      |
+| Wake      | 0x66    |
+| On        | 0xBF    |
+| Off       | 0x80    |
+| Low       | 0x1F    |
+| High      | 0x3F    |
 
-I did not capture the commands for timer settings since almost everyone would do that using their home automation anyway.
+I did not bother to capture the commands for timer settings since almost everyone would do that using their home automation anyway.
+
+On every signal I captured, there was some leading zero padding followed by a sequence of 0x55 (`0 1 0 1 0 1 0 1`). Immediate after this, the preamble starts with `1 0 1 0 1 0...` repeating for 64 bits. I haven't been able to figure out what causes this first part of the signal but I suspect it's just noise from the transmitter ramping up. Thankfully this doesn't actually matter since the preamble and sync word are enough for the receiver to pick up the rest of the packet.
+
+![Screenshot of signal capture of the first few bytes of the signal](images/signal-start.png "signal start screenshot")
+
+While this starting bit doesn't really affect the receiver, it did make reverse engineering the packets a little trickier since it affects where the preamble "starts". I found I actually needed to work backwards from the sync words to determine that the preamble was just a `1 0 1 0 1 0...` 64 bits in length.
+
+## Notes
+
+Understanding the packet format was the hardest part of this process. When I started digging into the signal analysis using URH, it was clear that the remote was sending each packet 3 times and that it also sends a command I called "wake" when you first click a button on the remote. I believe that this wake command is to make pairing easier.
+
+It also seems that the fan itself echos back the packets it receives, but the signal is incredibly weak. I brought my laptop and SDR into the attic and was only barely able to see the signal appear and it wasn't clear enough to decode. There's no way the remote is able to receive that response with the minimal antenna it has inside the housing. I suspect QuietCool originally intended the fan to report the operating state back to the remote but ultimately abandoned that effort.
+
+The full captures of the commands are in this repo at [signals.complex16s](signals.complex16s).
+
+One other little quirk is that the carrier frequency on my remote is different from that on my friend's who has almost the same exact fan. The only difference between ours is that mine is the Eco version which shouldn't affect the signal at all.
+
+You can see the difference here in two recordings of a full packet, first on my remote then on my friend's.
+
+![Screenshot of signal capture with lower frequency carrier wave](images/full-packet-mine.png "my remote full packet")
+![Screenshot of signal capture with higher frequency carrier wave](images/full-packet-friend.png "friend's remote full packet")
+
+# Arduino version
+
+While this repo provides a component YAML file that works in ESPHome without any other code or components, I also developed a proof-of-concept with the same hardware using pure arduino code.
+
+Before I fully decoded the packet format, I was able to get basic controls by writing raw data to the CC1101 chip (as opposed to using its packet formats and preamble generation). The code in the `arduino` directory is the result of this effort if you want to look at it and fiddle with it.
+
+The arduino version provides the ability to read your remote ID and is also the only way to produce the "wake" command so it may be useful for other efforts. I will note that the arduino code could be rewritten now that I understand the full packet structure but for now it just has the entire start + preamble embedded as the "sync word" and the sync word + length + ID as the id.
