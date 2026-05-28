@@ -1,15 +1,3 @@
-esphome:
-  name: house-fan
-  friendly_name: house fan
-
-esp32:
-  variant: esp32s3
-  framework:
-    type: arduino
-
-logger:
-  level: DEBUG
-
 globals:
   - id: remote_id
     type: 'uint8_t[4]'
@@ -74,8 +62,7 @@ cc1101:
           ESP_LOGD("quietcool-fan", "         from remote ID: [0x%02x, 0x%02x, 0x%02x, 0x%02x]", x[0], x[1], x[2], x[3]);
 
           if (id(autoset_remote)) {
-            std::vector<uint8_t> rcvd_remote_id(x.begin(), x.begin()+4);
-            memcpy(id(remote_id), rcvd_remote_id.data(), 4);
+            memcpy(id(remote_id), x.data(), 4);
             id(autoset_remote) = false;
           }
 
