@@ -16,6 +16,10 @@ Once you have your hardware all squared away, you'll need [ESPHome](https://esph
 
 Simply change the settings in the YAML to match your pins and remote ID (see comments for how to determine remote ID if you don't know it and aren't pairing), install to the ESP32 using the ESPHome dashboard, and you should now be able to control your house fan from the ESP32 device. If you're using ESPHome in Home Assistant it should show up as a fan device. If you're not using Home Assistant you can add `web_server:` to the component YAML and navigate to the device's IP address (visible from the device logs in ESPHome) in a browser and control it from there.
 
+## Troubleshooting
+
+If you are able to read your remote's ID but the ESP32 isn't controlling your fan, try changing the frequency value in the component YAML. The CC1101 chips aren't perfect and so their centers may not be dialed in out of the box. Increase or decrease the value 0.01MHz at a time and retry. One user reported theirs started working at 433.96MHz so try stepping it up to 0.1MHz in either direction and if it still doesn't work, let me know by submitting an Issue here or commenting on the [Home Assisant community thread](https://community.home-assistant.io/t/quietcool-whole-house-fan-rf-glass-remote-integration/1012030?u=thadd).
+
 # Reverse Engineering the QuietCool RF Protocol
 
 I'll describe my process below but will give the details of the protocol first. I believe the remote uses a Silicon Labs radio chip. That doesn't really matter, but the sync word used matches the Si4xxx series chips' default sync word so I think it's a safe bet. Everything else is somewhat standard RF formats with one exception.

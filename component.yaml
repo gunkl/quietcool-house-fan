@@ -50,6 +50,13 @@ cc1101:
   gdo0_pin: 3
 
 ####################################################################################################
+# CC1101 chips might not have perfect center frequencies. If yours doesn't work out when you start
+# off, try setting this parameter up or down to dial it in. Several users on the Home Assistant
+# community have reported tha the default didn't work for them and they had to change this value.
+####################################################################################################
+  frequency: 433.92MHz
+
+####################################################################################################
 # You shouldn't need to change anything below this line. See the README if you want details
 # on how the protocol works.
 ####################################################################################################
@@ -111,16 +118,19 @@ script:
 fan:
   - platform: template
     name: "quietcool whole house fan"
+    id: house_fan
     speed_count: 2
     restore_mode: RESTORE_DEFAULT_OFF
     on_turn_on:
       - script.execute:
           id: send_command
           command: 0xbf
+      - lambda: !lambda 'id(house_fan).speed = 2;'
     on_turn_off: 
       - script.execute:
           id: send_command
           command: 0x80
+      - lambda: !lambda 'id(house_fan).speed = 0;'
     on_speed_set:
       - if:
           condition:
