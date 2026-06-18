@@ -53,8 +53,11 @@ cc1101:
 # CC1101 chips might not have perfect center frequencies. If yours doesn't work out when you start
 # off, try setting this parameter up or down to dial it in. Several users on the Home Assistant
 # community have reported tha the default didn't work for them and they had to change this value.
+# The lines commented out are frequencies verified to work by other testers so start with those. 
 ####################################################################################################
   frequency: 433.92MHz
+#  frequency: 433.94MHz
+#  frequency: 433.96MHz
 
 ####################################################################################################
 # You shouldn't need to change anything below this line. See the README if you want details
