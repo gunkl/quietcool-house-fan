@@ -1,5 +1,14 @@
 # QuietCool Whole House Attic Fan support in ESPHome and Home Assistant
 
+> **Fork note:** This is a copy of the upstream project by **thadd** at
+> <https://codeberg.org/thadd/quietcool-house-fan>, maintained here to add **receive** support
+> (decode the physical remote's presses — including the timer buttons — and expose them to Home
+> Assistant) for use with the [Climate Advisor](https://github.com/gunkl/ClimateAdvisor)
+> integration. Full credit for the original transmit implementation and protocol
+> reverse-engineering goes to thadd (and to Caleb Crome, cited below). The upstream repository
+> does not currently include a LICENSE file; this copy is retained privately pending
+> clarification of licensing/attribution with the original author.
+
 This project aims to provide a way to add your QuietCool whole house attic fan to Home Assistant via ESP Home. Huge thank you to Caleb Crome who reverse engineered an older model and released the code on [his Github](https://github.com/ccrome/quiet-cool-rf-remote). My version of this works on the newer fans that use the "glass" remote with touchscreen buttons rather than physical ones.
 
 The QC fans require the remote to be paired with the fan so you have two options for how to connect. You either need to know the ID value of your existing remote or you need to pair a "remote" with a new ID to your fan. See the comments in the sample [component.yaml](component.yaml) file for details.
