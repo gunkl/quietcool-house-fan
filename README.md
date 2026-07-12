@@ -61,28 +61,42 @@ The following are the transmit settings for the signals:
 
 Each packet is sent 3 times, separated by 70ms. The command codes are:
 
-| Command   | Value   |
-|-----------|---------|
-| Wake      | 0x66    |
-| On        | 0xBF    |
-| Off       | 0x80    |
-| Low       | 0x1F    |
-| High      | 0x3F    |
-| Timer 1h  | *TBD — see [Issue #1](https://github.com/gunkl/quietcool-house-fan/issues/1)* |
-| Timer 2h  | *TBD* |
-| Timer 4h  | *TBD* |
-| Timer 8h  | *TBD* |
-| Timer 12h | *TBD* |
+| Command       | Value | Confidence |
+|---------------|-------|------------|
+| Wake          | 0x66  | Confirmed |
+| Power: On     | 0xBF  | Very likely — confirmed with correct remote ID in live capture, not yet from a dedicated isolated press test |
+| Power: Off    | 0x80  | Confirmed — dedicated isolated capture |
+| Speed: Low    | 0x1F  | Confirmed |
+| Speed: Medium | 0x2F  | **Untested/assumed** — falls directly between Low and High in the speed family; this fan is 2-speed and can't exercise it, documented as if it functioned |
+| Speed: High   | 0x3F  | Confirmed |
+| Timer: 1h     | 0x91  | Confirmed |
+| Timer: 2h     | 0x92  | Confirmed |
+| Timer: 4h     | 0x94  | Confirmed |
+| Timer: 8h     | 0x98  | Confirmed |
+| Timer: 12h    | 0x9C  | Confirmed |
+| Timer: None   | 0x9F  | Confirmed |
+
+The timer family fixes the high nibble at `0x9` and uses the low nibble as the literal hour
+count (`1,2,4,8,C`=12), with `F` (max) as the "no timer" sentinel — the speed family mirrors
+this by fixing the *low* nibble at `F` and varying the high nibble (`1`→low, `2`→medium,
+`3`→high).
 
 The original project didn't bother capturing the timer commands, since almost everyone would
 set a timer via home automation anyway. This fork adds **remote-receive** support instead — it
 decodes what the *physical wall remote* sends (including the timer buttons) and exposes it to
 Home Assistant as `event.quietcool_remote`, so a person's direct request to the remote (e.g.
-"run for 8 hours") is observable, not just commands sent by the ESP itself. See
+"run for 8 hours") is observable, not just commands sent by the ESP itself.
+
+**Important protocol characteristic:** the remote is a periodic-status *beacon*, not a
+burst-per-press transmitter — after any single interaction it re-broadcasts its full current
+status (power, speed, timer) for several seconds. `component.yaml`'s `on_packet` handler
+therefore fires `event.quietcool_remote` only when a field's newly-reported value differs from
+its last-held value (edge-triggered), not on every repeated packet. A handful of other status
+bytes the remote emits (e.g. `0x50`, `0x8C`, `0xB0`, `0xDE`, `0x43`) don't correspond to any of
+the three user-controllable fields and are intentionally left undecoded — see
 [Issue #1](https://github.com/gunkl/quietcool-house-fan/issues/1) and
 [docs/remote-capture-protocol.md](docs/remote-capture-protocol.md) for the capture procedure
-used to discover the timer codes above, and `component.yaml`'s `on_packet` handler for the
-decode logic.
+and full findings, and `component.yaml`'s `on_packet` handler for the decode logic.
 
 On every signal I captured, there was some leading zero padding followed by a sequence of 0x55 (`0 1 0 1 0 1 0 1`). Immediate after this, the preamble starts with `1 0 1 0 1 0...` repeating for 64 bits. I haven't been able to figure out what causes this first part of the signal but I suspect it's just noise from the transmitter ramping up. Thankfully this doesn't actually matter since the preamble and sync word are enough for the receiver to pick up the rest of the packet.
 

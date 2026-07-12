@@ -48,16 +48,31 @@ globals:
     restore_value: false
     initial_value: '0'
 
-  # Tracks the last *received* command + when, purely to de-duplicate a burst of identical
-  # packets from a single physical button press (our own send_command sends every command 3x
-  # with 70ms gaps; the remote may do something similar -- see docs/remote-capture-protocol.md
-  # step 2/3 to confirm and tune REMOTE_RX_DEBOUNCE_MS below if needed).
-  - id: last_rx_command
+  # -- Field state (Issue #1) -----------------------------------------------------------------
+  # The remote is a periodic-status BEACON, not a burst-per-press transmitter: after any single
+  # interaction it re-broadcasts its full current status (power, speed, and timer, in rotation)
+  # for several seconds, so the same byte can legitimately repeat many times a second or so
+  # apart even though the user pressed nothing new. A received byte is therefore a *reported
+  # value* for one of these three independent fields, not itself an event.
+  #
+  # Each global below holds the last-ACCEPTED (held) value for one field, as its raw command
+  # byte -- the byte already fully identifies the value within its field (the power/speed/timer
+  # byte-spaces are disjoint), so no separate enum/translation layer is needed. An HA event
+  # fires only when a newly-decoded field's reported value differs from its held value (an
+  # edge/transition); a heartbeat re-announcing an unchanged value is silently absorbed no
+  # matter how long it repeats. See the on_packet handler below and
+  # docs/remote-capture-protocol.md. `0x00` is a safe "never observed" sentinel for all three --
+  # no real byte in any of the three families is `0x00`.
+  - id: power_state
     type: uint8_t
     restore_value: false
-    initial_value: '255'  # sentinel -- none of our known command bytes are 0xFF
-  - id: last_rx_command_ms
-    type: uint32_t
+    initial_value: '0'
+  - id: speed_state
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: timer_state
+    type: uint8_t
     restore_value: false
     initial_value: '0'
 
@@ -102,12 +117,19 @@ cc1101:
     then:
       - lambda: |-
           // ==== Remote-receive support (Issue #1) =========================================
-          // See docs/remote-capture-protocol.md for the test procedure used to discover the
-          // command bytes below, and for the semantics captured about bursts/keepalives/
-          // sequences that inform the constants and guards in this handler.
+          // ONTOLOGY -- read this before touching this handler:
+          // The remote is a periodic-status BEACON, not a burst-per-press transmitter. After
+          // any single interaction it re-broadcasts its full current status (power, speed,
+          // timer -- in rotation) for several seconds. A received byte is a *reported value*
+          // for one of those three fields; it is NOT itself a press event. The only thing that
+          // should ever reach Home Assistant is a *change*: a field's newly-reported value
+          // differing from what we last held for that field. Do NOT reintroduce a time-window
+          // debounce here -- a real heartbeat re-announcement several seconds later is
+          // indistinguishable from "a new press of the same value" under any fixed time window;
+          // only comparing against the held per-field value gets this right. See
+          // docs/remote-capture-protocol.md for how this was discovered.
 
-          static const uint32_t REMOTE_RX_DEBOUNCE_MS = 250;  // tune after running the capture protocol
-          static const uint32_t SELF_ECHO_WINDOW_MS = 500;    // tune after running the capture protocol
+          static const uint32_t SELF_ECHO_WINDOW_MS = 500;  // tune after running the capture protocol
 
           uint32_t now_ms = millis();
           uint8_t cmd = x[4];
@@ -115,25 +137,23 @@ cc1101:
           bool id_match = (x[0] == id(remote_id)[0] && x[1] == id(remote_id)[1] &&
                            x[2] == id(remote_id)[2] && x[3] == id(remote_id)[3]);
 
-          // Known command bytes (5 confirmed from the transmit side; 5 timer bytes are
-          // placeholders -- fill in from docs/remote-capture-protocol.md, then uncomment the
-          // matching lines in BOTH blocks below (name + token)).
+          // Known command bytes, for logging only (does not gate field decode below).
           const char *name = "UNKNOWN";
           if (cmd == 0x66) name = "KNOWN(wake)";
-          else if (cmd == 0x80) name = "KNOWN(off)";
-          else if (cmd == 0x1f) name = "KNOWN(low)";
-          else if (cmd == 0x3f) name = "KNOWN(high)";
-          else if (cmd == 0xbf) name = "KNOWN(on/high)";
-          // -- fill in from capture protocol, then uncomment: --
-          // else if (cmd == 0x??) name = "KNOWN(timer_1h)";
-          // else if (cmd == 0x??) name = "KNOWN(timer_2h)";
-          // else if (cmd == 0x??) name = "KNOWN(timer_4h)";
-          // else if (cmd == 0x??) name = "KNOWN(timer_8h)";
-          // else if (cmd == 0x??) name = "KNOWN(timer_12h)";
+          else if (cmd == 0x80) name = "KNOWN(power=off)";
+          else if (cmd == 0xbf) name = "KNOWN(power=on)";
+          else if (cmd == 0x1f) name = "KNOWN(speed=low)";
+          else if (cmd == 0x2f) name = "KNOWN(speed=medium, untested)";
+          else if (cmd == 0x3f) name = "KNOWN(speed=high)";
+          else if (cmd == 0x91) name = "KNOWN(timer=1h)";
+          else if (cmd == 0x92) name = "KNOWN(timer=2h)";
+          else if (cmd == 0x94) name = "KNOWN(timer=4h)";
+          else if (cmd == 0x98) name = "KNOWN(timer=8h)";
+          else if (cmd == 0x9c) name = "KNOWN(timer=12h)";
+          else if (cmd == 0x9f) name = "KNOWN(timer=none)";
 
-          uint32_t since_last_rx_ms = id(last_rx_command_ms) == 0 ? 0 : now_ms - id(last_rx_command_ms);
-          ESP_LOGD("quietcool-fan", "Remote command received: 0x%02x [%s] id_match=%s since_last_rx_ms=%u",
-                   cmd, name, id_match ? "yes" : "no", since_last_rx_ms);
+          ESP_LOGD("quietcool-fan", "Remote command received: 0x%02x [%s] id_match=%s",
+                   cmd, name, id_match ? "yes" : "no");
           ESP_LOGD("quietcool-fan", "         from remote ID: [0x%02x, 0x%02x, 0x%02x, 0x%02x]",
                    x[0], x[1], x[2], x[3]);
 
@@ -146,37 +166,57 @@ cc1101:
           if (!id_match) return;
 
           // Self-echo guard: ignore a received packet that is just hearing our own transmit
-          // (send_command below stamps last_sent_command/_ms right before sending).
+          // (send_command below stamps last_sent_command/_ms right before sending). This is
+          // UNRELATED to the field/heartbeat model above -- it only protects against hearing
+          // our own just-sent command, never against the remote's own repeats.
           uint32_t since_last_tx_ms = now_ms - id(last_sent_command_ms);
           if (id(last_sent_command_ms) != 0 && cmd == id(last_sent_command) && since_last_tx_ms < SELF_ECHO_WINDOW_MS) {
             ESP_LOGD("quietcool-fan", "Suppressed as self-echo (cmd 0x%02x sent %u ms ago)", cmd, since_last_tx_ms);
             return;
           }
 
-          // De-dup a burst of identical packets from a single physical button press.
-          bool is_repeat = (cmd == id(last_rx_command)) && (since_last_rx_ms < REMOTE_RX_DEBOUNCE_MS);
-          id(last_rx_command) = cmd;
-          id(last_rx_command_ms) = now_ms;
-          if (is_repeat) {
-            ESP_LOGD("quietcool-fan", "Suppressed as duplicate within debounce window");
+          // ---- POWER field ----------------------------------------------------------------
+          if (cmd == 0xbf || cmd == 0x80) {
+            if (cmd != id(power_state)) {
+              id(power_state) = cmd;
+              id(quietcool_remote_event).trigger(cmd == 0xbf ? "on" : "off");
+            }
             return;
           }
 
-          std::string token = "";
-          if (cmd == 0xbf) token = "on";
-          else if (cmd == 0x80) token = "off";
-          else if (cmd == 0x1f) token = "low";
-          else if (cmd == 0x3f) token = "high";
-          // -- fill in from capture protocol, then uncomment: --
-          // else if (cmd == 0x??) token = "timer_1h";
-          // else if (cmd == 0x??) token = "timer_2h";
-          // else if (cmd == 0x??) token = "timer_4h";
-          // else if (cmd == 0x??) token = "timer_8h";
-          // else if (cmd == 0x??) token = "timer_12h";
-
-          if (!token.empty()) {
-            id(quietcool_remote_event).trigger(token);
+          // ---- SPEED field ------------------------------------------------------------------
+          if (cmd == 0x1f || cmd == 0x2f || cmd == 0x3f) {
+            if (cmd != id(speed_state)) {
+              id(speed_state) = cmd;
+              std::string token = (cmd == 0x1f) ? "low" : (cmd == 0x2f) ? "medium" : "high";
+              id(quietcool_remote_event).trigger(token);
+            }
+            return;
           }
+
+          // ---- TIMER field ------------------------------------------------------------------
+          if (cmd == 0x91 || cmd == 0x92 || cmd == 0x94 || cmd == 0x98 || cmd == 0x9c || cmd == 0x9f) {
+            if (cmd != id(timer_state)) {
+              id(timer_state) = cmd;
+              std::string token;
+              if (cmd == 0x91) token = "timer_1h";
+              else if (cmd == 0x92) token = "timer_2h";
+              else if (cmd == 0x94) token = "timer_4h";
+              else if (cmd == 0x98) token = "timer_8h";
+              else if (cmd == 0x9c) token = "timer_12h";
+              // 0x9f ("no timer") has no HA token of its own -- it isn't a duration to hold,
+              // it's the absence of one. Held state above still updates so a later real timer
+              // press correctly detects the transition back into a duration.
+              if (!token.empty()) {
+                id(quietcool_remote_event).trigger(token);
+              }
+            }
+            return;
+          }
+
+          // Anything else (0x50, 0x8c, 0xb0, 0xde, 0x43, ...) is remote status chatter that
+          // doesn't belong to a known field -- intentionally not decoded (see
+          // docs/remote-capture-protocol.md "de-prioritized" section). Already logged above.
 
 script:
   - id: send_command
@@ -258,9 +298,11 @@ fan:
 
 ####################################################################################################
 # Remote-receive support (Issue #1): exposes decoded remote button presses to Home Assistant.
-# The on_packet handler above fires this event with one of the event_types below once a press
-# is decoded (self-echo and duplicate-burst filtered). The timer_* types will not fire until
-# their command bytes are captured and filled in above -- see docs/remote-capture-protocol.md.
+# The on_packet handler above fires this event with one of the event_types below only when a
+# field's reported value changes from what was previously held (edge-triggered) -- the remote
+# re-announces its full status every few seconds after any interaction, and those repeats are
+# intentionally absorbed, not fired again. "medium" speed is untested (this fan is 2-speed) but
+# documented as if it functioned, per project decision -- see docs/remote-capture-protocol.md.
 ####################################################################################################
 event:
   - platform: template
@@ -270,8 +312,9 @@ event:
     event_types:
       - "on"
       - "off"
-      - "high"
       - "low"
+      - "medium"
+      - "high"
       - "timer_1h"
       - "timer_2h"
       - "timer_4h"

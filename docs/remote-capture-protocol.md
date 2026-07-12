@@ -1,123 +1,75 @@
-# QuietCool Remote — Button Capture Protocol
+# QuietCool Remote — Button Capture Protocol & Findings
 
-Purpose: discover the RF command byte(s) the physical wall remote sends for each button —
-especially the five **timer** durations (1h/2h/4h/8h/12h), which were never captured by the
-original project (the fan's own transmit side only needed on/off/low/high). This also
-characterizes real remote behavior (bursts, keepalives, mid-timer off) that the decode logic
-in `component.yaml` depends on.
+This document originally specified the test procedure for discovering the physical remote's
+command bytes (especially the five **timer** durations, never captured by the original
+project). That capture has now been run — this document records the procedure **and** the
+confirmed results, for anyone re-verifying on different hardware or extending the decode.
 
-Run this once, live, against your paired remote and installed ESP32. Flash the build with the
-Step A/C/D changes first (enhanced `on_packet` logging + the `event.quietcool_remote` entity —
-the timer bytes are placeholders at this point and simply won't decode to a token yet, which is
-expected and harmless).
+## Confirmed codes vs. known states
 
-## Before you start
-
-- Confirm `remote_id` in `component.yaml` matches your paired remote (or `autoset_remote` has
-  learned it) — you should see `id_match=yes` on every log line from this remote.
-- Watch logs live: `esphome logs component.yaml` (or the ESPHome dashboard's log viewer), filtered
-  for `quietcool-fan`.
-- Each log line now looks like:
-  ```
-  [D][quietcool-fan]: Remote command received: 0x3f [KNOWN(high)] id_match=yes since_last_rx_ms=1523
-  [D][quietcool-fan]:          from remote ID: [0xcb, 0x00, 0xd5, 0x12]
-  ```
-  `since_last_rx_ms` is the gap since the previous *distinct* (post-debounce) received command —
-  useful for telling a single button's burst apart from two separate presses.
-
-## Step 1 — Sanity pass (validates the pipeline before testing unknowns)
-
-Press each of these once, ~5s apart, and confirm the log tags it `KNOWN` with the expected name:
-
-| Button | Expected byte | Expected tag |
-|---|---|---|
-| On | `0xbf` | `KNOWN(on/high)` |
-| Off | `0x80` | `KNOWN(off)` |
-| Low | `0x1f` | `KNOWN(low)` |
-| High | `0x3f` | `KNOWN(high)` |
-
-**If any of these come back `UNKNOWN` or with an unexpected byte, stop here** — the remote
-pairing/ID is likely wrong. Fix that before continuing; the timer results below are meaningless
-until the sanity pass is clean.
-
-## Step 2 — Timer buttons, isolated
-
-For each of **1h, 2h, 4h, 8h, 12h** (in that order), with the fan off beforehand:
-
-1. Press the button once.
-2. Wait 10 seconds.
-3. Record every distinct `UNKNOWN 0x??` byte logged for this press (there may be more than one
-   distinct byte — see Step 3).
-4. Turn the fan off (press Off) to reset state before the next button.
-5. Press the **same** timer button again to confirm the byte(s) repeat identically.
-
-Fill in as you go:
-
-| Button | Byte(s) seen (1st press) | Byte(s) seen (2nd press, repeat check) | Notes |
+| Field | State | Code | Confidence |
 |---|---|---|---|
-| 1h  | | | |
-| 2h  | | | |
-| 4h  | | | |
-| 8h  | | | |
-| 12h | | | |
+| Power | On | `0xBF` | Very likely — matches the known transmit-side byte, confirmed with correct remote ID in a live capture (the low→high speed-change sequence), but not yet from a dedicated *isolated* press test the way Off was. |
+| Power | Off | `0x80` | **Confirmed** — dedicated isolated test, correct remote ID. |
+| Speed | Low | `0x1F` | **Confirmed** — reconfirmed in the high→low transition. |
+| Speed | Medium | `0x2F` | **Untested/assumed.** Falls directly between Low and High in the speed family (low nibble fixed at `F`, high nibble `1`→low/`2`→medium/`3`→high). This fan is 2-speed and can't exercise it — documented as if it functioned, per project decision, for forward compatibility. |
+| Speed | High | `0x3F` | **Confirmed** — reconfirmed in the low→high transition. |
+| Timer | 1h | `0x91` | **Confirmed** |
+| Timer | 2h | `0x92` | **Confirmed** |
+| Timer | 4h | `0x94` | **Confirmed** |
+| Timer | 8h | `0x98` | **Confirmed** |
+| Timer | 12h | `0x9C` | **Confirmed** |
+| Timer | None | `0x9F` | **Confirmed** |
 
-## Step 3 — Sequence check
+The timer family fixes the high nibble at `0x9` and uses the low nibble as the literal hour
+count, with `0xF` as the "no timer" sentinel. Also confirmed: `0x66` = Wake (pairing-related
+chatter, not a user-actionable field).
 
-While doing Step 2, check whether each timer press produced:
-- **(a) One distinct command byte** (repeated 2-3x in a tight burst, `since_last_rx_ms` small
-  between repeats) — the simple case, decode is a flat byte → token map.
-- **(b) Two different distinct bytes in sequence** (e.g. an implicit "on" byte followed by a
-  separate "duration" byte, a beat apart) — some remotes signal mode+confirm as two packets.
-  If so, note the exact pair and the typical gap between them (`since_last_rx_ms` on the second
-  line) — decode will need to combine the pair within that window into one `timer_Nh` token
-  instead of firing on the first byte alone.
+**De-prioritized — remote status chatter, not user commands:** `0x50`, `0x8c`, `0xb0`, `0xde`,
+and `0x43` were observed but don't correspond to any of the three user-controllable fields
+(power/speed/timer). They're intentionally left undecoded in `component.yaml` — they don't
+affect what Climate Advisor needs from this integration. (One unconfirmed, non-blocking
+observation: `0xb0` followed `0x80` in the Off sequence the same way `0xbf` followed `0x3f` in
+a speed change — possibly a general "power-field re-announcement" pattern, not verified.)
 
-Record your finding: ☐ (a) single byte per timer button   ☐ (b) two-byte sequence — pair: ______
+## The key protocol discovery: this is a heartbeat, not a burst-per-press
 
-## Step 4 — Idle / keepalive check
+The original assumption (matching the upstream README) was one press → one tight burst of ~3
+identical packets ~70ms apart, then silence. A capture of a single LOW-speed press instead
+showed `0x1F` repeating **6 times over ~6 seconds**, with **two `0x9F` (timer=none) readings
+interspersed partway through** — confirmed to be from a *single* button press, not repeated
+presses.
 
-1. Press an 8h timer button to start it.
-2. Do **not** press anything else. Let the log run for 10–15 minutes.
-3. Record whether any further `quietcool-fan` log lines appear during that idle window (from
-   the remote — not from any HA-side on/off calls you might trigger separately).
+**Conclusion: the remote periodically re-broadcasts its full current status** (power, speed,
+timer, in rotation) for several seconds after any interaction. This is why `component.yaml`
+does **not** use a time-window debounce to filter repeats — no fixed window can distinguish
+"still re-announcing an old press" from "a new press of the same value several seconds later."
+Instead, `on_packet` tracks the last-*held* value per field and fires `event.quietcool_remote`
+only when a field's newly-decoded value differs from what's currently held (edge-triggered).
+See the ontology comment at the top of the `on_packet` handler in `component.yaml` for the
+full reasoning — **do not reintroduce a time-based debounce for this purpose.**
 
-Result: ☐ No packets during idle countdown   ☐ Periodic keepalive packets seen — byte(s): ______, roughly every ______ 
+## Original capture procedure (for reference / re-verification on other hardware)
 
-If keepalives are seen and their byte matches a timer token, the existing 250ms debounce window
-is too short to suppress them (they're minutes apart) — a different mechanism (state-based: "a
-timer token was already accepted and hasn't changed value") would be needed; flag this back
-before uncommenting the timer branches.
+1. **Sanity pass**: press On, Off, Low, High once each, ~5s apart — confirms the logging
+   pipeline and remote pairing (`id_match=yes`) before testing anything else.
+2. **Timer buttons, isolated**: press each of 1h/2h/4h/8h/12h once, wait ~10s, record the
+   distinct byte(s); press again to confirm repeatability.
+3. **Sequence check**: confirmed a *single* byte per field (not a two-packet mode+confirm
+   sequence) — the flat per-field byte→token decode in `component.yaml` is correct as-is.
+4. **Idle/heartbeat check**: confirmed via the LOW-speed capture above — the remote
+   re-announces status for several seconds after any interaction; this is what drove the
+   edge-triggered redesign.
+5. **Physical-off-during-timer check**: confirmed — the already-known `0x80` byte appears when
+   Off is pressed mid-timer, same as a normal off. Validates the assumption the Climate Advisor
+   integration ([gunkl/ClimateAdvisor#486](https://github.com/gunkl/ClimateAdvisor/issues/486))
+   relies on.
+6. **Re-press/override check**: pressing a different timer duration while one is running simply
+   emits the new duration's byte directly (no distinct "cancel" signal observed) — the
+   edge-triggered decode handles this correctly already, since any value change fires.
 
-## Step 5 — Physical-off-during-timer check
+## Remaining optional follow-up (not blocking)
 
-1. Start any timer duration.
-2. Before it expires, press **Off** on the remote.
-3. Confirm the log shows the already-known `0x80` (`KNOWN(off)`) byte, same as a normal off.
-
-Result: ☐ Confirmed off byte is 0x80 as expected   ☐ Different — byte seen: ______
-
-This validates an assumption the Climate Advisor integration (issue
-[gunkl/ClimateAdvisor#486](https://github.com/gunkl/ClimateAdvisor/issues/486)) relies on: a
-mid-timer manual off is detectable the same way as any other off.
-
-## Step 6 — Re-press / override check
-
-1. Start one timer duration (e.g. 4h).
-2. Before it expires, press a **different** duration button (e.g. 8h).
-3. Record what's logged: does the remote send a distinct "cancel" signal first, or does it just
-   emit the new duration's byte directly?
-
-Result: ______________________________________________
-
-## After completing this protocol
-
-1. Fill in the 5 discovered timer bytes in `component.yaml`'s `on_packet` handler — uncomment
-   and complete the two placeholder blocks (`name` tagging block and `token` decode block).
-2. If Step 3 found a two-byte sequence, extend the decode logic to combine the pair (a small
-   follow-up — flag it in the issue rather than guessing the shape here).
-3. If Step 4 found keepalives that would defeat the debounce window, flag it in the issue before
-   uncommenting the timer branches — a state-based guard is needed instead of (or in addition
-   to) the time-based debounce.
-4. Reflash and re-verify each of the 9 buttons fires the correct `event_type` on
-   `event.quietcool_remote` in Home Assistant → Developer Tools → Events.
-5. Update the byte table in `README.md` with the confirmed timer codes.
+An isolated "fan off → press ON only → watch" capture, mirroring the rigor of the Off test,
+would upgrade Power/On from "very likely" to "confirmed." Not required — the feature works
+correctly either way.
