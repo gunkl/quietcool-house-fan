@@ -164,29 +164,41 @@ cc1101:
       - lambda: |-
           // ==== Remote-receive support (Issue #1) =========================================
           // ONTOLOGY -- read this before touching this handler:
-          // The remote is a periodic-status BEACON, not a burst-per-press transmitter. After
-          // any single interaction it re-broadcasts its full current status (power, speed,
-          // timer -- in rotation) for several seconds. A received byte is a *reported value*
-          // for one of those three fields; it is NOT itself a press event. The only thing that
-          // should ever reach Home Assistant is a *change*: a field's newly-reported value
-          // differing from what we last held for that field. Do NOT reintroduce a time-window
-          // debounce here -- a real heartbeat re-announcement several seconds later is
-          // indistinguishable from "a new press of the same value" under any fixed time window;
-          // only comparing against the held per-field value gets this right.
+          // The remote reports its status (power, speed, timer) only while transmitting after
+          // an interaction. The ONLY guarantee is that a single genuine command is sent 3x in a
+          // tight burst (~70-260ms apart, by the protocol's own convention). Sometimes multiple
+          // fields' commands are seen together (e.g. speed + timer, 3x each), and sometimes the
+          // whole sequence repeats a few times -- but that is an OBSERVED behavior, not a
+          // guarantee to design around. Do not assume continuous/indefinite re-announcement, and
+          // do not rely on "a later repeat will confirm it if this burst doesn't."
           //
-          // A single reading is not enough to trust, though: the receiver occasionally decodes
-          // garbage with the CORRECT remote ID but a corrupted command byte, which can
-          // coincidentally land on a byte that's a real, valid value for a field -- purely
-          // because of which bit flipped. A real transmission always repeats (3x per value, by
-          // the protocol's own convention), so before a newly-differing value updates the held
-          // state / fires an event, it must be seen TWICE, matching, within CONFIRM_WINDOW_MS --
-          // see the pending_*_value/count/ms globals above. A non-matching reading in between
-          // just starts its own fresh candidate (for whichever field it belongs to); it does not
-          // invalidate a value that's already confirmed. See docs/remote-capture-protocol.md for
-          // the capture evidence behind both of these rules.
+          // A received byte is a *reported value* for one of the three fields, not itself a
+          // press event. The only thing that should ever reach Home Assistant is a *change*: a
+          // field's newly-reported value differing from what we last held for that field. Do NOT
+          // reintroduce a time-window debounce against the HELD value -- a real repeat of an
+          // already-confirmed value is indistinguishable from "a new press of the same value"
+          // under any fixed time window; only comparing against the held per-field value gets
+          // that right.
+          //
+          // A single reading is not enough to trust a NEW value, though: the receiver
+          // occasionally decodes garbage with the CORRECT remote ID but a corrupted command
+          // byte, which can coincidentally land on a byte that's a real, valid value -- either
+          // for a different field entirely, or for a different value WITHIN the same field
+          // (e.g. a bit-flipped High can misread as Medium). Since only 3x per genuine command is
+          // guaranteed, a newly-differing value must be confirmed by a SECOND matching reading
+          // before it updates the held state / fires an event -- see the pending_*_value/count/ms
+          // globals above. A non-matching reading for a DIFFERENT field never interferes (routed
+          // independently). A non-matching reading for the SAME field, arriving within
+          // SAME_BURST_TOLERANCE_MS of the current candidate, is treated as a possible corrupted
+          // copy of the SAME burst and is ignored outright (not overwritten) -- this is what
+          // correctly reads a 3f,2f,3f sequence as "confirmed 3f, discard the 2f" rather than
+          // resetting progress on the mismatch. Beyond that short tolerance, a differing
+          // same-field reading is trusted as a genuinely new candidate and does overwrite. See
+          // docs/remote-capture-protocol.md for the capture evidence behind these rules.
 
-          static const uint32_t SELF_ECHO_WINDOW_MS = 500;   // tune after running the capture protocol
-          static const uint32_t CONFIRM_WINDOW_MS = 1500;    // covers same-burst repeats + one heartbeat cycle
+          static const uint32_t SELF_ECHO_WINDOW_MS = 500;        // tune after running the capture protocol
+          static const uint32_t SAME_BURST_TOLERANCE_MS = 400;    // covers the ~70-260ms intra-burst spacing, with margin
+          static const uint32_t CONFIRM_WINDOW_MS = 1500;         // overall candidate lifetime before it's abandoned
 
           uint32_t now_ms = millis();
           uint8_t cmd = x[4];
@@ -245,15 +257,22 @@ cc1101:
             if (normalized == id(power_state)) {
               return;  // heartbeat re-confirming already-accepted state
             }
+            uint32_t power_age_ms = now_ms - id(pending_power_ms);
             if (id(pending_power_count) > 0 && id(pending_power_value) == normalized &&
-                (now_ms - id(pending_power_ms)) <= CONFIRM_WINDOW_MS) {
+                power_age_ms <= CONFIRM_WINDOW_MS) {
+              // Matches the in-progress candidate -- confirm.
               id(pending_power_count) += 1;
               if (id(pending_power_count) >= 2) {
                 id(power_state) = normalized;
                 id(quietcool_remote_event).trigger(normalized == 0xbf ? "on" : "off");
                 id(pending_power_count) = 0;
               }
+            } else if (id(pending_power_count) > 0 && power_age_ms <= SAME_BURST_TOLERANCE_MS) {
+              // Mismatch, but still inside the same 3x burst window -- likely a corrupted copy
+              // of the candidate we're already tracking. Ignore it; do not lose progress.
+              ESP_LOGD("quietcool-fan", "Power: ignoring mismatched 0x%02x within same-burst tolerance", cmd);
             } else {
+              // No candidate, or the mismatch is late enough to be a genuinely new value.
               id(pending_power_value) = normalized;
               id(pending_power_count) = 1;
               id(pending_power_ms) = now_ms;
@@ -266,8 +285,10 @@ cc1101:
             if (cmd == id(speed_state)) {
               return;  // heartbeat re-confirming already-accepted state
             }
+            uint32_t speed_age_ms = now_ms - id(pending_speed_ms);
             if (id(pending_speed_count) > 0 && id(pending_speed_value) == cmd &&
-                (now_ms - id(pending_speed_ms)) <= CONFIRM_WINDOW_MS) {
+                speed_age_ms <= CONFIRM_WINDOW_MS) {
+              // Matches the in-progress candidate -- confirm.
               id(pending_speed_count) += 1;
               if (id(pending_speed_count) >= 2) {
                 id(speed_state) = cmd;
@@ -275,7 +296,13 @@ cc1101:
                 id(quietcool_remote_event).trigger(token);
                 id(pending_speed_count) = 0;
               }
+            } else if (id(pending_speed_count) > 0 && speed_age_ms <= SAME_BURST_TOLERANCE_MS) {
+              // Mismatch, but still inside the same 3x burst window -- likely a corrupted copy
+              // of the candidate we're already tracking (e.g. 3f, 2f, 3f: the 2f is discarded
+              // here, the two 3f readings still confirm). Ignore it; do not lose progress.
+              ESP_LOGD("quietcool-fan", "Speed: ignoring mismatched 0x%02x within same-burst tolerance", cmd);
             } else {
+              // No candidate, or the mismatch is late enough to be a genuinely new value.
               id(pending_speed_value) = cmd;
               id(pending_speed_count) = 1;
               id(pending_speed_ms) = now_ms;
@@ -288,8 +315,10 @@ cc1101:
             if (cmd == id(timer_state)) {
               return;  // heartbeat re-confirming already-accepted state
             }
+            uint32_t timer_age_ms = now_ms - id(pending_timer_ms);
             if (id(pending_timer_count) > 0 && id(pending_timer_value) == cmd &&
-                (now_ms - id(pending_timer_ms)) <= CONFIRM_WINDOW_MS) {
+                timer_age_ms <= CONFIRM_WINDOW_MS) {
+              // Matches the in-progress candidate -- confirm.
               id(pending_timer_count) += 1;
               if (id(pending_timer_count) >= 2) {
                 id(timer_state) = cmd;
@@ -307,7 +336,12 @@ cc1101:
                 }
                 id(pending_timer_count) = 0;
               }
+            } else if (id(pending_timer_count) > 0 && timer_age_ms <= SAME_BURST_TOLERANCE_MS) {
+              // Mismatch, but still inside the same 3x burst window -- likely a corrupted copy
+              // of the candidate we're already tracking. Ignore it; do not lose progress.
+              ESP_LOGD("quietcool-fan", "Timer: ignoring mismatched 0x%02x within same-burst tolerance", cmd);
             } else {
+              // No candidate, or the mismatch is late enough to be a genuinely new value.
               id(pending_timer_value) = cmd;
               id(pending_timer_count) = 1;
               id(pending_timer_ms) = now_ms;

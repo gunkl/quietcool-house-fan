@@ -62,30 +62,31 @@ theory can't explain. Lesson: a clean bit-distance coincidence is not sufficient
 corruption on its own — only a dedicated, isolated capture (or the burst/ID-corruption pattern
 above) reliably distinguishes a real code from noise.
 
-## The key protocol discovery: this is a heartbeat, not a burst-per-press
+## The key protocol discovery: repeats happen, but are not a guarantee to design around
 
 The original assumption (matching the upstream README) was one press → one tight burst of ~3
 identical packets ~70ms apart, then silence. A capture of a single LOW-speed press instead
 showed `0x1F` repeating **6 times over ~6 seconds**, with **two `0x9F` (timer=none) readings
 interspersed partway through** — confirmed to be from a *single* button press, not repeated
-presses.
+presses. Later captures reconfirmed this happening with other fields too (a lone `0xBF` amid a
+`0x3F` run; continued `0x9F` repeats during a steady On/Low state).
 
-**Conclusion: the remote periodically re-broadcasts its full current status** (power, speed,
-timer, in rotation) for several seconds after any interaction. This is why `component.yaml`
-does **not** use a time-window debounce to filter repeats — no fixed window can distinguish
-"still re-announcing an old press" from "a new press of the same value several seconds later."
-Instead, `on_packet` tracks the last-*held* value per field and fires `event.quietcool_remote`
-only when a field's newly-decoded value differs from what's currently held (edge-triggered).
-See the ontology comment at the top of the `on_packet` handler in `component.yaml` for the
-full reasoning — **do not reintroduce a time-based debounce for this purpose.**
+**Important correction (from later, more careful review): the remote only transmits while it's
+actively "on" from an interaction, and repeats beyond the guaranteed 3×-per-command are an
+*observed* behavior, not something to rely on architecturally.** Sometimes multiple fields'
+commands are seen together (speed + timer, 3× each), and sometimes the whole sequence repeats a
+few times — but this is not indefinite, not continuous, and must not be assumed to always
+happen. **The only real guarantee is: a genuine command is sent 3× in a tight burst.** Do not
+design logic that depends on "if this attempt fails, a later repeat will save it."
 
-Confirmed twice more in later captures: a lone `0xbf` (power) interspersed mid-run of `0x3f`
-(speed) repeats during an On/High sequence, and `0x9f` (timer=none) continuing to repeat
-several times even while the fan sat steady at On/Low with nothing timer-related pressed. All
-three fields free-run their heartbeat continuously and independently of each other and of
-power state — not just the field that most recently changed. The edge-triggered design handles
-this correctly as far as *repeats of an already-held value* go; see the next section for why a
-single differing reading still isn't enough to trust on its own.
+This is still why `component.yaml` does **not** use a time-window debounce against the *held*
+value to filter repeats — no fixed window can distinguish "re-announcing an old, already-known
+value" from "a new press of the same value" purely by elapsed time; comparing against the held
+per-field value is what gets that right, regardless of whether/how many repeats occur. See the
+ontology comment at the top of the `on_packet` handler in `component.yaml` for the full
+reasoning — **do not reintroduce a time-based debounce against the held value for this
+purpose.** But since repeats of a *genuinely new* value are bounded (not guaranteed beyond 3×),
+a *new* value needs a different, tighter mechanism to be trusted — see the next section.
 
 ## Multi-reception confirmation: a single reading is not enough
 
@@ -96,36 +97,51 @@ bit flipped. This is exactly what made `0xBF` briefly look like a possible corru
 in an earlier draft of this document (see above) — a single ambiguous reading, with no way to
 tell real from corrupted without a dedicated follow-up test.
 
-**The fix, generalized:** since a real transmission always repeats (3× per value, per the
-protocol's own convention), `component.yaml`'s `on_packet` now requires a value to be seen
-**twice, matching, within `CONFIRM_WINDOW_MS` (1500ms)** before it updates the held state or
+**The fix, generalized:** since a real command is guaranteed to be sent 3× (per the protocol's
+own convention) but *not* guaranteed to repeat beyond that, `component.yaml`'s `on_packet` now
+requires a differing value to be seen **twice, matching**, before it updates the held state or
 fires an HA event — on top of the existing edge-trigger (a value equal to what's already held is
 always just a heartbeat, handled as before). A `pending_<field>_value/count/ms` global per field
-tracks a candidate in progress:
+tracks a candidate in progress, with **two timing tiers**:
 
 - First differing reading of a field → becomes the pending candidate (count=1).
-- A second reading of the *same* value within the window → confirmed: held state updates, event
-  fires, pending resets.
-- A differing reading in between (e.g. a corrupted byte for the *same* field, or a real reading
-  for a *different* field, which routes independently) → does not invalidate an
-  already-confirmed value; it only starts its *own* fresh candidate for whichever field it
-  belongs to.
-- A candidate that never gets a second matching reading within the window is silently abandoned
-  (the same window check that confirms a match also naturally lets a stale candidate expire —
-  no separate expiry step needed).
+- A second reading of the *same* value, within `CONFIRM_WINDOW_MS` (1500ms) → confirmed: held
+  state updates, event fires, pending resets.
+- A **mismatching** reading for the same field, arriving within the tighter
+  `SAME_BURST_TOLERANCE_MS` (400ms) of the candidate's first sighting, is treated as a possibly
+  corrupted copy of the *same* burst and is **ignored outright** — it does not overwrite the
+  candidate. This is what correctly handles a sequence like `3F, 2F, 3F` (a bit-flip corruption
+  landing on a different value *within the same field*): the `2F` is discarded, and the two
+  clean `3F` readings still confirm normally.
+- A mismatching reading arriving *after* `SAME_BURST_TOLERANCE_MS` (but still within
+  `CONFIRM_WINDOW_MS`) is trusted as a genuinely new candidate and **does** overwrite — by then
+  it's very unlikely to be a corrupted copy of the original burst, and treating it conservatively
+  would only delay recognizing a real second press.
+- A reading for a **different field** never interferes with a field's own candidate at all
+  (fields are routed independently to disjoint byte ranges) — so an interleaved `0xBF` amid a
+  `0x3F` run, in any order, is always handled correctly (see the ordering check below).
+- A candidate that never gets a second matching reading within `CONFIRM_WINDOW_MS` is silently
+  abandoned — the same window check that confirms a match also naturally lets a stale candidate
+  expire, no separate expiry step needed.
 
-**1500ms was chosen from observed timing**: genuine same-burst repeats land 70–260ms apart; the
-heartbeat gap between separate re-announcement bursts has been observed up to ~950ms–1s. 1500ms
-comfortably covers both "two hits in the same burst" and "one hit now, one hit on the very next
-heartbeat cycle," while still requiring the same corrupted byte to coincidentally land twice for
-noise to ever be falsely accepted — a much rarer event than a single stray misread.
+**Explicitly verified, order-independent, for a corrupted byte from a *different* field** (e.g.
+real signal = 3× `0x3F`, one corrupted to `0xBF`): `BF,3F,3F` / `3F,BF,3F` / `3F,3F,BF` are all
+accepted correctly, since `0xBF` routes to the POWER block regardless of position and never
+touches the SPEED field's pending state.
 
-This resolves the `0xBF`/`0x3F` ambiguity (and similar cases, like the isolated `0xB4` and the
-`0x74`/`0x8d`/`0x14` interference cluster seen in later captures) generically going forward — no
-more one-off dedicated tests needed to settle whether a single reading was real. Applies
-uniformly to all three fields, including `timer=none` (`0x9F`), which has no HA token of its own
-but still needs its held state confirmed correctly so a later real timer duration is detected as
-a genuine change.
+**Timing tiers chosen from observed data**: genuine same-burst repeats land 70–260ms apart
+(`SAME_BURST_TOLERANCE_MS=400` gives comfortable margin over that); `CONFIRM_WINDOW_MS=1500` is
+a generous *upper bound* that also happens to cover the ~950ms–1s heartbeat gap observed between
+separate re-announcement bursts when one occurs — but per the correction above, that extra
+repeat is a bonus, not something relied upon; the design must (and does) work correctly using
+only the guaranteed 3×-per-command burst.
+
+This resolves the `0xBF`/`0x3F` ambiguity, the same-field `3F`/`2F` case, and similar noise seen
+in captures (the isolated `0xB4`, the `0x74`/`0x8d`/`0x14` interference cluster) generically
+going forward — no more one-off dedicated tests needed to settle whether a single reading was
+real. Applies uniformly to all three fields, including `timer=none` (`0x9F`), which has no HA
+token of its own but still needs its held state confirmed correctly so a later real timer
+duration is detected as a genuine change.
 
 ## Original capture procedure (for reference / re-verification on other hardware)
 
