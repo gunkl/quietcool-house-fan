@@ -6,8 +6,9 @@
 > Assistant) for use with the [Climate Advisor](https://github.com/gunkl/ClimateAdvisor)
 > integration. Full credit for the original transmit implementation and protocol
 > reverse-engineering goes to thadd (and to Caleb Crome, cited below). The upstream repository
-> does not currently include a LICENSE file; this copy is retained privately pending
-> clarification of licensing/attribution with the original author.
+> does not currently publish a license; this fork is offered under the [MIT license](LICENSE)
+> in the same open spirit as the original, with full attribution preserved. If thadd would
+> prefer different terms, please open an issue and this will be updated.
 
 This project aims to provide a way to add your QuietCool whole house attic fan to Home Assistant via ESP Home. Huge thank you to Caleb Crome who reverse engineered an older model and released the code on [his Github](https://github.com/ccrome/quiet-cool-rf-remote). My version of this works on the newer fans that use the "glass" remote with touchscreen buttons rather than physical ones.
 
