@@ -68,8 +68,21 @@ Each packet is sent 3 times, separated by 70ms. The command codes are:
 | Off       | 0x80    |
 | Low       | 0x1F    |
 | High      | 0x3F    |
+| Timer 1h  | *TBD — see [Issue #1](https://github.com/gunkl/quietcool-house-fan/issues/1)* |
+| Timer 2h  | *TBD* |
+| Timer 4h  | *TBD* |
+| Timer 8h  | *TBD* |
+| Timer 12h | *TBD* |
 
-I did not bother to capture the commands for timer settings since almost everyone would do that using their home automation anyway.
+The original project didn't bother capturing the timer commands, since almost everyone would
+set a timer via home automation anyway. This fork adds **remote-receive** support instead — it
+decodes what the *physical wall remote* sends (including the timer buttons) and exposes it to
+Home Assistant as `event.quietcool_remote`, so a person's direct request to the remote (e.g.
+"run for 8 hours") is observable, not just commands sent by the ESP itself. See
+[Issue #1](https://github.com/gunkl/quietcool-house-fan/issues/1) and
+[docs/remote-capture-protocol.md](docs/remote-capture-protocol.md) for the capture procedure
+used to discover the timer codes above, and `component.yaml`'s `on_packet` handler for the
+decode logic.
 
 On every signal I captured, there was some leading zero padding followed by a sequence of 0x55 (`0 1 0 1 0 1 0 1`). Immediate after this, the preamble starts with `1 0 1 0 1 0...` repeating for 64 bits. I haven't been able to figure out what causes this first part of the signal but I suspect it's just noise from the transmitter ramping up. Thankfully this doesn't actually matter since the preamble and sync word are enough for the receiver to pick up the rest of the packet.
 

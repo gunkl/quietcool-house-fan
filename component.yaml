@@ -35,6 +35,32 @@ globals:
 ####################################################################################################
     initial_value: 'false'
 
+  # -- Remote-receive support (Issue #1) -----------------------------------------------------
+  # Tracks the last command WE transmitted (via the send_command script below) and when, so a
+  # received packet that merely echoes our own transmission is not misread as a remote button
+  # press. See the on_packet handler and docs/remote-capture-protocol.md.
+  - id: last_sent_command
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: last_sent_command_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  # Tracks the last *received* command + when, purely to de-duplicate a burst of identical
+  # packets from a single physical button press (our own send_command sends every command 3x
+  # with 70ms gaps; the remote may do something similar -- see docs/remote-capture-protocol.md
+  # step 2/3 to confirm and tune REMOTE_RX_DEBOUNCE_MS below if needed).
+  - id: last_rx_command
+    type: uint8_t
+    restore_value: false
+    initial_value: '255'  # sentinel -- none of our known command bytes are 0xFF
+  - id: last_rx_command_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
 ####################################################################################################
 # Set these pin numbers to the ESP32 pins corresponding to how you wired up your CC1101
 # chip. If you used the default SPI pins you might only need to set the two in the cc1101
@@ -75,12 +101,81 @@ cc1101:
   on_packet:
     then:
       - lambda: |-
-          ESP_LOGD("quietcool-fan", "Remote command received: 0x%02x", x[4]);
-          ESP_LOGD("quietcool-fan", "         from remote ID: [0x%02x, 0x%02x, 0x%02x, 0x%02x]", x[0], x[1], x[2], x[3]);
+          // ==== Remote-receive support (Issue #1) =========================================
+          // See docs/remote-capture-protocol.md for the test procedure used to discover the
+          // command bytes below, and for the semantics captured about bursts/keepalives/
+          // sequences that inform the constants and guards in this handler.
+
+          static const uint32_t REMOTE_RX_DEBOUNCE_MS = 250;  // tune after running the capture protocol
+          static const uint32_t SELF_ECHO_WINDOW_MS = 500;    // tune after running the capture protocol
+
+          uint32_t now_ms = millis();
+          uint8_t cmd = x[4];
+
+          bool id_match = (x[0] == id(remote_id)[0] && x[1] == id(remote_id)[1] &&
+                           x[2] == id(remote_id)[2] && x[3] == id(remote_id)[3]);
+
+          // Known command bytes (5 confirmed from the transmit side; 5 timer bytes are
+          // placeholders -- fill in from docs/remote-capture-protocol.md, then uncomment the
+          // matching lines in BOTH blocks below (name + token)).
+          const char *name = "UNKNOWN";
+          if (cmd == 0x66) name = "KNOWN(wake)";
+          else if (cmd == 0x80) name = "KNOWN(off)";
+          else if (cmd == 0x1f) name = "KNOWN(low)";
+          else if (cmd == 0x3f) name = "KNOWN(high)";
+          else if (cmd == 0xbf) name = "KNOWN(on/high)";
+          // -- fill in from capture protocol, then uncomment: --
+          // else if (cmd == 0x??) name = "KNOWN(timer_1h)";
+          // else if (cmd == 0x??) name = "KNOWN(timer_2h)";
+          // else if (cmd == 0x??) name = "KNOWN(timer_4h)";
+          // else if (cmd == 0x??) name = "KNOWN(timer_8h)";
+          // else if (cmd == 0x??) name = "KNOWN(timer_12h)";
+
+          uint32_t since_last_rx_ms = id(last_rx_command_ms) == 0 ? 0 : now_ms - id(last_rx_command_ms);
+          ESP_LOGD("quietcool-fan", "Remote command received: 0x%02x [%s] id_match=%s since_last_rx_ms=%u",
+                   cmd, name, id_match ? "yes" : "no", since_last_rx_ms);
+          ESP_LOGD("quietcool-fan", "         from remote ID: [0x%02x, 0x%02x, 0x%02x, 0x%02x]",
+                   x[0], x[1], x[2], x[3]);
 
           if (id(autoset_remote)) {
             memcpy(id(remote_id), x.data(), 4);
             id(autoset_remote) = false;
+          }
+
+          // ==== HA event decode (Issue #1, only for packets from our paired remote/fan) ====
+          if (!id_match) return;
+
+          // Self-echo guard: ignore a received packet that is just hearing our own transmit
+          // (send_command below stamps last_sent_command/_ms right before sending).
+          uint32_t since_last_tx_ms = now_ms - id(last_sent_command_ms);
+          if (id(last_sent_command_ms) != 0 && cmd == id(last_sent_command) && since_last_tx_ms < SELF_ECHO_WINDOW_MS) {
+            ESP_LOGD("quietcool-fan", "Suppressed as self-echo (cmd 0x%02x sent %u ms ago)", cmd, since_last_tx_ms);
+            return;
+          }
+
+          // De-dup a burst of identical packets from a single physical button press.
+          bool is_repeat = (cmd == id(last_rx_command)) && (since_last_rx_ms < REMOTE_RX_DEBOUNCE_MS);
+          id(last_rx_command) = cmd;
+          id(last_rx_command_ms) = now_ms;
+          if (is_repeat) {
+            ESP_LOGD("quietcool-fan", "Suppressed as duplicate within debounce window");
+            return;
+          }
+
+          std::string token = "";
+          if (cmd == 0xbf) token = "on";
+          else if (cmd == 0x80) token = "off";
+          else if (cmd == 0x1f) token = "low";
+          else if (cmd == 0x3f) token = "high";
+          // -- fill in from capture protocol, then uncomment: --
+          // else if (cmd == 0x??) token = "timer_1h";
+          // else if (cmd == 0x??) token = "timer_2h";
+          // else if (cmd == 0x??) token = "timer_4h";
+          // else if (cmd == 0x??) token = "timer_8h";
+          // else if (cmd == 0x??) token = "timer_12h";
+
+          if (!token.empty()) {
+            id(quietcool_remote_event).trigger(token);
           }
 
 script:
@@ -89,6 +184,10 @@ script:
     parameters:
       command: int
     then:
+      - lambda: |-
+          // Stamp what we're about to send (Issue #1 self-echo guard, see on_packet above).
+          id(last_sent_command) = (uint8_t) command;
+          id(last_sent_command_ms) = millis();
       - cc1101.send_packet:
           data: !lambda |-
             std::vector<uint8_t> packet(id(remote_id), id(remote_id)+4);
@@ -156,4 +255,26 @@ fan:
             - script.execute:
                 id: send_command
                 command: 0x3f
+
+####################################################################################################
+# Remote-receive support (Issue #1): exposes decoded remote button presses to Home Assistant.
+# The on_packet handler above fires this event with one of the event_types below once a press
+# is decoded (self-echo and duplicate-burst filtered). The timer_* types will not fire until
+# their command bytes are captured and filled in above -- see docs/remote-capture-protocol.md.
+####################################################################################################
+event:
+  - platform: template
+    name: "QuietCool Remote"
+    id: quietcool_remote_event
+    device_class: button
+    event_types:
+      - "on"
+      - "off"
+      - "high"
+      - "low"
+      - "timer_1h"
+      - "timer_2h"
+      - "timer_4h"
+      - "timer_8h"
+      - "timer_12h"
 
