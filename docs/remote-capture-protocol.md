@@ -143,6 +143,77 @@ real. Applies uniformly to all three fields, including `timer=none` (`0x9F`), wh
 token of its own but still needs its held state confirmed correctly so a later real timer
 duration is detected as a genuine change.
 
+## Bugs found via live testing, and their fixes
+
+### Boot-time transmission (fixed)
+
+**Symptom:** on a reboot (e.g. reflashing), the fan was set to HIGH by the ESP itself, with no
+button press.
+
+**Diagnosis:** the `fan:` platform's `restore_mode: RESTORE_DEFAULT_OFF` restores the **last
+known state** on boot if one was persisted (defaulting to off only when nothing was ever
+stored). Template-based platforms have no independent way to reflect a restored state except by
+**replaying their configured action triggers** during `setup()` — which, in this component,
+includes the real RF transmission via `send_command`. Since the fan's last commanded state
+(from earlier testing) was on/high, a reboot restored and replayed it, genuinely transmitting
+to the physical fan with no user action. This is a known, commonly-discussed pattern for
+ESPHome template switch/fan platforms generally, not something specific to this file — not
+directly confirmed against ESPHome's own docs (they're sparse on this exact point), so flagged
+with that caveat, but the symptom matches the mechanism precisely.
+
+**Fix:** a `booted_up` global, `false` until 2 seconds after `esphome: on_boot:` fires, gates
+only the `script.execute: send_command` step in `fan:`'s `on_turn_on`/`on_turn_off`/`on_speed_set`
+triggers. The entity's local state (`id(house_fan).speed = ...`) still updates unconditionally,
+so Home Assistant correctly shows the restored value — it just doesn't retransmit to force the
+physical fan to match on every boot. A genuine post-boot command (from HA or a config change)
+transmits normally once `booted_up` is `true`.
+
+### ID-level corruption rejecting an otherwise-good command byte (fixed)
+
+**Symptom:** setting Low from High sometimes did not fire the `low` event at all.
+
+**Diagnosis:** two `0x1F` packets arrived, but the first had ID `[cb,00,cc,26]` vs. the correct
+`[cb,00,cc,27]` — a 1-bit difference — and was rejected by the exact `id_match` check before it
+could ever reach the Speed field's confirmation logic. Only the second, exact-match `0x1F` got
+through, leaving the field stuck at `count=1` forever with no second confirming reading. The
+command byte itself was correct both times; only the ID envelope was corrupted.
+
+**Fix:** `id_match` is now a **fuzzy match** — the total Hamming distance (differing bits) across
+all 4 ID bytes, tolerant up to `ID_FUZZY_MATCH_BITS=2`. Cross-checked against every previously
+catalogued event in this document: every confirmed-noise packet differs by **5–6 bits**; every
+near-miss ID seen alongside an otherwise-genuine command byte (this `...26`/`...27` case, and an
+earlier `0xB0` reading with ID `...67` vs `...27`) was **1 bit** off. A 2-bit tolerance admits
+both real near-misses while continuing to reject every catalogued noise event by a wide margin.
+The raw bit-distance is now logged (`id_diff_bits=N`) alongside the yes/no match result, for
+future diagnosis.
+
+### Outright packet loss leaving only one copy (accepted limitation, not fixed)
+
+**Symptom:** setting High from Low sometimes did not fire the `high` event; only **one** `0x3F`
+packet was received at all (correct ID, correct value) — the other two real copies were never
+received in any form (not corrupted-and-filtered, simply never decoded).
+
+**Decision: not fixed.** A fallback mechanism (accept a single unconfirmed reading after N
+seconds of silence with nothing to confirm or contradict it) was considered and explicitly
+declined — it would reopen a small residual risk (a single corrupted reading landing on a
+different field's valid byte could eventually be accepted with nothing to contradict it) in
+exchange for not dropping genuine single-copy-reception presses. The trade-off wasn't judged
+worth it. **This is a known, accepted limitation**: if only one copy of a genuine value is ever
+received, that press will not register, and the user may need to re-press. Revisit only if this
+proves to be a frequent, practical annoyance rather than a rare edge case.
+
+### Interpretation rule for consumers: "off" is the only explicit power-down signal
+
+Pressing the remote to resume power (with no explicit speed change) transmits `wake` plus
+whatever field(s) actually changed — it does **not** reliably re-transmit Speed if the remote
+already considers it unchanged from before. A consumer of `event.quietcool_remote` (the Climate
+Advisor integration, [gunkl/ClimateAdvisor#486](https://github.com/gunkl/ClimateAdvisor/issues/486))
+**cannot assume a dedicated `on` event always accompanies power-up.** The reliable rule: **`off`
+is the only explicit, authoritative power-down signal; receipt of *any* other event
+(`on`/`low`/`medium`/`high`/`timer_*`) implies the fan is currently on.** #486's future
+`handle_remote_command` design should derive "the fan is on" from any non-off event, not wait
+specifically for an `"on"` token.
+
 ## Original capture procedure (for reference / re-verification on other hardware)
 
 1. **Sanity pass**: press On, Off, Low, High once each, ~5s apart — confirms the logging

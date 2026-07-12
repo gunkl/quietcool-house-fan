@@ -1,4 +1,29 @@
+####################################################################################################
+# Boot guard (Issue #1): prevents this ESP from TRANSMITTING to the physical fan on boot.
+#
+# The `fan:` template platform below has restore_mode: RESTORE_DEFAULT_OFF, which restores the
+# LAST KNOWN state on boot (defaulting to off only if nothing was ever persisted). Template
+# platforms have no independent way to reflect a restored state except by replaying their
+# configured action triggers (on_turn_on/on_speed_set) during setup() -- which, in this
+# component, includes a REAL RF transmission via send_command. Without a guard, a routine reboot
+# (firmware update, power blip) would silently re-command the physical fan to whatever HA last
+# recorded, with no user action at all. `booted_up` gates only the transmit step (see the fan:
+# section below) -- the entity's reported state still updates locally either way, so HA shows the
+# correct restored value; it just doesn't retransmit to force the physical fan to match.
+####################################################################################################
+esphome:
+  on_boot:
+    priority: -100    # after other components have finished their own setup/restore
+    then:
+      - delay: 2s      # comfortably longer than template-entity restore/apply takes
+      - lambda: 'id(booted_up) = true;'
+
 globals:
+  - id: booted_up
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
   - id: remote_id
     type: 'uint8_t[4]'
     restore_value: true
@@ -199,12 +224,29 @@ cc1101:
           static const uint32_t SELF_ECHO_WINDOW_MS = 500;        // tune after running the capture protocol
           static const uint32_t SAME_BURST_TOLERANCE_MS = 400;    // covers the ~70-260ms intra-burst spacing, with margin
           static const uint32_t CONFIRM_WINDOW_MS = 1500;         // overall candidate lifetime before it's abandoned
+          static const uint8_t ID_FUZZY_MATCH_BITS = 2;           // tolerate this many differing bits across the 4 ID bytes
 
           uint32_t now_ms = millis();
           uint8_t cmd = x[4];
 
-          bool id_match = (x[0] == id(remote_id)[0] && x[1] == id(remote_id)[1] &&
-                           x[2] == id(remote_id)[2] && x[3] == id(remote_id)[3]);
+          // Fuzzy ID match (Issue #1): an exact-equality check rejected a genuine command byte
+          // whose ID envelope suffered a 1-bit corruption while the command byte itself was
+          // perfectly intact (observed live: a real Speed=Low reading arrived with ID
+          // [cb,00,cc,26] instead of [cb,00,cc,27] -- 1 bit off -- and was discarded before ever
+          // reaching the confirm logic below, leaving only one usable reading and no event
+          // fired). Every catalogued NOISE packet in docs/remote-capture-protocol.md differs by
+          // 5-6 bits; every near-miss ID seen alongside an otherwise-genuine command byte has
+          // been 1 bit off. A tolerance of ID_FUZZY_MATCH_BITS=2 admits the real near-misses
+          // while still rejecting every catalogued noise event by a wide margin.
+          uint8_t id_diff_bits = 0;
+          for (uint8_t i = 0; i < 4; i++) {
+            uint8_t id_xor = x[i] ^ id(remote_id)[i];
+            while (id_xor) {
+              id_diff_bits += (id_xor & 1);
+              id_xor >>= 1;
+            }
+          }
+          bool id_match = (id_diff_bits <= ID_FUZZY_MATCH_BITS);
 
           // Known command bytes, for logging only (does not gate field decode below).
           const char *name = "UNKNOWN";
@@ -222,8 +264,8 @@ cc1101:
           else if (cmd == 0x9c) name = "KNOWN(timer=12h)";
           else if (cmd == 0x9f) name = "KNOWN(timer=none)";
 
-          ESP_LOGD("quietcool-fan", "Remote command received: 0x%02x [%s] id_match=%s",
-                   cmd, name, id_match ? "yes" : "no");
+          ESP_LOGD("quietcool-fan", "Remote command received: 0x%02x [%s] id_match=%s (id_diff_bits=%u)",
+                   cmd, name, id_match ? "yes" : "no", id_diff_bits);
           ESP_LOGD("quietcool-fan", "         from remote ID: [0x%02x, 0x%02x, 0x%02x, 0x%02x]",
                    x[0], x[1], x[2], x[3]);
 
@@ -407,34 +449,45 @@ fan:
     id: house_fan
     speed_count: 2
     restore_mode: RESTORE_DEFAULT_OFF
+    # Every transmit below is gated on id(booted_up) (see the boot guard at the top of this file)
+    # so that RESTORE_DEFAULT_OFF's boot-time state replay updates the entity's reported state
+    # without re-commanding the physical fan. Only genuine post-boot triggers actually transmit.
     on_turn_on:
-      - script.execute:
-          id: send_command
-          command: 0xbf
+      - if:
+          condition:
+            lambda: 'return id(booted_up);'
+          then:
+            - script.execute:
+                id: send_command
+                command: 0xbf
       - lambda: !lambda 'id(house_fan).speed = 2;'
-    on_turn_off: 
-      - script.execute:
-          id: send_command
-          command: 0x80
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(booted_up);'
+          then:
+            - script.execute:
+                id: send_command
+                command: 0x80
       - lambda: !lambda 'id(house_fan).speed = 0;'
     on_speed_set:
       - if:
           condition:
-            lambda: !lambda 'return x == 0;'
+            lambda: !lambda 'return id(booted_up) && x == 0;'
           then:
             - script.execute:
                 id: send_command
                 command: 0x80
       - if:
           condition:
-            lambda: !lambda 'return x == 1;'
+            lambda: !lambda 'return id(booted_up) && x == 1;'
           then:
             - script.execute:
                 id: send_command
                 command: 0x1f
       - if:
           condition:
-            lambda: !lambda 'return x == 2;'
+            lambda: !lambda 'return id(booted_up) && x == 2;'
           then:
             - script.execute:
                 id: send_command
