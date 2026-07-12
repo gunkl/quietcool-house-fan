@@ -140,7 +140,8 @@ cc1101:
           // Known command bytes, for logging only (does not gate field decode below).
           const char *name = "UNKNOWN";
           if (cmd == 0x66) name = "KNOWN(wake)";
-          else if (cmd == 0x80) name = "KNOWN(power=off)";
+          else if (cmd == 0x80) name = "KNOWN(power=off, action)";
+          else if (cmd == 0xb0) name = "KNOWN(power=off, status)";
           else if (cmd == 0xbf) name = "KNOWN(power=on)";
           else if (cmd == 0x1f) name = "KNOWN(speed=low)";
           else if (cmd == 0x2f) name = "KNOWN(speed=medium, untested)";
@@ -175,11 +176,18 @@ cc1101:
             return;
           }
 
-          // ---- POWER field ----------------------------------------------------------------
-          if (cmd == 0xbf || cmd == 0x80) {
-            if (cmd != id(power_state)) {
-              id(power_state) = cmd;
-              id(quietcool_remote_event).trigger(cmd == 0xbf ? "on" : "off");
+          // ---- POWER field ------------------------------------------------------------------
+          // 0x80 (fired once, as the action, right when Off is pressed) and 0xB0 (the ongoing
+          // status re-announcement of the same fact -- seen on wake/heartbeat, not just right
+          // after a press) both mean "off". Normalize to one canonical value so a 0xB0 arriving
+          // moments after a 0x80 doesn't double-fire. There is no equivalent second byte for
+          // On: On's status *is* whatever Speed is currently held, so it needs no separate
+          // status byte of its own. See docs/remote-capture-protocol.md.
+          if (cmd == 0xbf || cmd == 0x80 || cmd == 0xb0) {
+            uint8_t normalized = (cmd == 0xbf) ? 0xbf : 0x80;
+            if (normalized != id(power_state)) {
+              id(power_state) = normalized;
+              id(quietcool_remote_event).trigger(normalized == 0xbf ? "on" : "off");
             }
             return;
           }
@@ -214,8 +222,8 @@ cc1101:
             return;
           }
 
-          // Anything else (0x50, 0x8c, 0xb0, 0xde, 0x43, ...) is remote status chatter that
-          // doesn't belong to a known field -- intentionally not decoded (see
+          // Anything else (0x50, 0x8c, 0xde, 0x43, ...) is remote status chatter that doesn't
+          // belong to a known field -- intentionally not decoded (see
           // docs/remote-capture-protocol.md "de-prioritized" section). Already logged above.
 
 script:

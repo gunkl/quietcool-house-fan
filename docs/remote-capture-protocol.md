@@ -9,8 +9,8 @@ confirmed results, for anyone re-verifying on different hardware or extending th
 
 | Field | State | Code | Confidence |
 |---|---|---|---|
-| Power | On | `0xBF` | Very likely — matches the known transmit-side byte, confirmed with correct remote ID in a live capture (the low→high speed-change sequence), but not yet from a dedicated *isolated* press test the way Off was. |
-| Power | Off | `0x80` | **Confirmed** — dedicated isolated test, correct remote ID. |
+| Power | On | `0xBF` | **Confirmed** — a dedicated "off → wake with no button pressed (default On/High/no-timer)" capture showed 5 clean `0xBF` readings across two separate bursts (proper ~1s heartbeat gap between them), correct ID throughout, with no competing code nearby. An earlier theory that `0xBF` might be RF corruption of `0x3F` (they differ by exactly one bit) is retracted — this dedicated test shows `0xBF` behaving exactly like every other genuine code (burst + heartbeat cadence, robust repetition), which a corruption theory can't explain since there was no `0x3F` present in that window for it to be a misread of. |
+| Power | Off | `0x80` (action) / `0xB0` (status) | **Confirmed, both** — `0x80` fires as the immediate action when Off is pressed; `0xB0` is a separate, equally real re-announcement of the same fact (seen after the action, and independently on a later plain wake-up with no fresh press). Normalize both to one canonical "off" value in decode logic so `0xB0` following `0x80` doesn't double-fire. |
 | Speed | Low | `0x1F` | **Confirmed** — reconfirmed in the high→low transition. |
 | Speed | Medium | `0x2F` | **Untested/assumed.** Falls directly between Low and High in the speed family (low nibble fixed at `F`, high nibble `1`→low/`2`→medium/`3`→high). This fan is 2-speed and can't exercise it — documented as if it functioned, per project decision, for forward compatibility. |
 | Speed | High | `0x3F` | **Confirmed** — reconfirmed in the low→high transition. |
@@ -30,25 +30,37 @@ chatter, not a user-actionable field).
 (power/speed/timer). They're intentionally left undecoded in `component.yaml` — they don't
 affect what Climate Advisor needs from this integration.
 
-**Open question — `0xb0` (seen twice more, still not decoded):** `0xb0` has now shown up
-cleanly (correct ID, repeated) in two independent captures: right after an Off button-press,
-and — separately, several seconds later, with no fresh press — while simply waking the remote
-up while the fan was already off. The second occurrence argues against "`0xb0` is a one-shot
-tail that only follows a fresh Off press" and toward "`0xb0` is the ongoing *heartbeat* value
-for power=off, distinct from `0x80` (the one-shot *action* byte for pressing Off)" — i.e. power
-may work differently from speed/timer, where the same byte serves as both the action and the
-heartbeat value. **Not confirmed** — `0x80` remains the correctly-decoded "off" value either
-way, since a real Off press always emits it, so this doesn't affect current behavior. Left
-undecoded pending more evidence; not blocking.
+**Resolved — `0xB0` is Off's status re-announcement, distinct from `0x80`'s action byte.**
+Unlike Speed/Timer (where one byte serves as both the action and the heartbeat value), Off
+gets two: `0x80` fires once, right when the button is pressed; `0xB0` is what gets re-announced
+afterward (on wake, on heartbeat), confirmed by it appearing on a later plain wake-up with no
+fresh press at all.
 
-**Noise heuristic (confirmed across two sessions, worth stating as a rule):** a genuine code
-from this remote always appears in a repeated burst (2–3+ occurrences, correct ID, close
-together). A code appearing **exactly once** — especially one that is a 1–2 bit flip away from
-a byte seen moments earlier — should be treated as likely RF corruption, not a new field value,
-until it recurs cleanly. Confirmed corruption examples so far: `0xbf` from a mismatched ID;
-`0x81` (one bit from `0x80`) from a corrupted ID; `0xb0` from a corrupted ID (distinct from the
-legitimate `0xb0` occurrences above); and a single isolated `0xb4` (one bit from `0xb0`)
-immediately preceding a real `0xb0`→`0xbf` transition — all discounted as noise under this rule.
+**Theory for why Off (and only Off) needs a dedicated status byte:** `0x66` (Wake) appears to
+function as a handshake — "I'm transmitting, listen for my status" — followed by a 3× burst of
+whatever the current status actually is. When the fan is On, that status slot is filled by the
+current **Speed** value (which already implies "on" — there's nothing else to report). When the
+fan is **Off**, there's no speed to report, so Off gets its own dedicated status byte (`0xB0`)
+to fill that slot. This explains why there's no equivalent second byte for "On" — On's status
+*is* whatever speed is currently held.
+
+**Noise heuristic (confirmed across multiple sessions):** a genuine code always appears as a
+3×-per-value transmission (matching the documented protocol behavior), though real-world
+corruption often leaves fewer than 3 clean copies. When a value looks anomalous, check whether
+it's a **corrupted sibling of an adjacent clean value** (wrong ID, or a 1-bit-different byte)
+rather than assuming it's a new code. Confirmed examples: `0xFF`/wrong-ID next to a clean `0xBF`
+pair; `0x81`/wrong-ID next to a clean `0x80` pair; a wrong-ID `0xB0` and a corrupted `0xB4`
+bracketing a clean `0xB0`. **Pattern noticed across all of these: the corrupted copy is
+consistently the *first* transmission attempt right after a silence gap** — plausibly a
+receiver settling effect (AGC/carrier-sense lock-on) rather than random noise scattered evenly
+across all three copies. When judging a burst, weight the 2nd/3rd readings over the 1st.
+
+This heuristic was tested against `0xBF` itself (it differs from `0x3F` by exactly one bit) and
+initially mis-classified as likely corruption — the dedicated On/default-High capture above
+overturned that: `0xBF` repeated cleanly 5× with no competing `0x3F` nearby, which a corruption
+theory can't explain. Lesson: a clean bit-distance coincidence is not sufficient evidence of
+corruption on its own — only a dedicated, isolated capture (or the burst/ID-corruption pattern
+above) reliably distinguishes a real code from noise.
 
 ## The key protocol discovery: this is a heartbeat, not a burst-per-press
 
@@ -93,8 +105,9 @@ handles this correctly with no changes needed.
    emits the new duration's byte directly (no distinct "cancel" signal observed) — the
    edge-triggered decode handles this correctly already, since any value change fires.
 
-## Remaining optional follow-up (not blocking)
+## Status: all three fields (power, speed, timer) fully confirmed
 
-An isolated "fan off → press ON only → watch" capture, mirroring the rigor of the Off test,
-would upgrade Power/On from "very likely" to "confirmed." Not required — the feature works
-correctly either way.
+The previously-suggested follow-up — an isolated "fan off → press ON only → watch" capture to
+upgrade Power/On from "very likely" to "confirmed" — has been superseded by a dedicated
+"off → wake with no button pressed" capture that confirmed `0xBF` (On) robustly, resolving the
+last open item. No further capture is required for the feature's core fields.
