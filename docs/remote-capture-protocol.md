@@ -25,12 +25,30 @@ The timer family fixes the high nibble at `0x9` and uses the low nibble as the l
 count, with `0xF` as the "no timer" sentinel. Also confirmed: `0x66` = Wake (pairing-related
 chatter, not a user-actionable field).
 
-**De-prioritized — remote status chatter, not user commands:** `0x50`, `0x8c`, `0xb0`, `0xde`,
-and `0x43` were observed but don't correspond to any of the three user-controllable fields
+**De-prioritized — remote status chatter, not user commands:** `0x50`, `0x8c`, `0xde`, and
+`0x43` were observed but don't correspond to any of the three user-controllable fields
 (power/speed/timer). They're intentionally left undecoded in `component.yaml` — they don't
-affect what Climate Advisor needs from this integration. (One unconfirmed, non-blocking
-observation: `0xb0` followed `0x80` in the Off sequence the same way `0xbf` followed `0x3f` in
-a speed change — possibly a general "power-field re-announcement" pattern, not verified.)
+affect what Climate Advisor needs from this integration.
+
+**Open question — `0xb0` (seen twice more, still not decoded):** `0xb0` has now shown up
+cleanly (correct ID, repeated) in two independent captures: right after an Off button-press,
+and — separately, several seconds later, with no fresh press — while simply waking the remote
+up while the fan was already off. The second occurrence argues against "`0xb0` is a one-shot
+tail that only follows a fresh Off press" and toward "`0xb0` is the ongoing *heartbeat* value
+for power=off, distinct from `0x80` (the one-shot *action* byte for pressing Off)" — i.e. power
+may work differently from speed/timer, where the same byte serves as both the action and the
+heartbeat value. **Not confirmed** — `0x80` remains the correctly-decoded "off" value either
+way, since a real Off press always emits it, so this doesn't affect current behavior. Left
+undecoded pending more evidence; not blocking.
+
+**Noise heuristic (confirmed across two sessions, worth stating as a rule):** a genuine code
+from this remote always appears in a repeated burst (2–3+ occurrences, correct ID, close
+together). A code appearing **exactly once** — especially one that is a 1–2 bit flip away from
+a byte seen moments earlier — should be treated as likely RF corruption, not a new field value,
+until it recurs cleanly. Confirmed corruption examples so far: `0xbf` from a mismatched ID;
+`0x81` (one bit from `0x80`) from a corrupted ID; `0xb0` from a corrupted ID (distinct from the
+legitimate `0xb0` occurrences above); and a single isolated `0xb4` (one bit from `0xb0`)
+immediately preceding a real `0xb0`→`0xbf` transition — all discounted as noise under this rule.
 
 ## The key protocol discovery: this is a heartbeat, not a burst-per-press
 
@@ -48,6 +66,13 @@ Instead, `on_packet` tracks the last-*held* value per field and fires `event.qui
 only when a field's newly-decoded value differs from what's currently held (edge-triggered).
 See the ontology comment at the top of the `on_packet` handler in `component.yaml` for the
 full reasoning — **do not reintroduce a time-based debounce for this purpose.**
+
+Confirmed twice more in later captures: a lone `0xbf` (power) interspersed mid-run of `0x3f`
+(speed) repeats during an On/High sequence, and `0x9f` (timer=none) continuing to repeat
+several times even while the fan sat steady at On/Low with nothing timer-related pressed. All
+three fields free-run their heartbeat continuously and independently of each other and of
+power state — not just the field that most recently changed. The edge-triggered design already
+handles this correctly with no changes needed.
 
 ## Original capture procedure (for reference / re-verification on other hardware)
 
