@@ -76,6 +76,52 @@ globals:
     restore_value: false
     initial_value: '0'
 
+  # -- Pending-candidate confirmation (Issue #1) -----------------------------------------------
+  # A single received packet is not reliable enough to act on: the receiver occasionally decodes
+  # garbage with the CORRECT remote ID but a corrupted command byte, which can coincidentally
+  # land on a byte that's a real, valid value for a field -- purely because of which bit flipped
+  # (a single-bit-corrupted Speed=High transmission can misread as a genuine-looking Power=On
+  # byte, for example). A real transmission always repeats (the protocol's own convention is 3x
+  # per value), so a value must be seen TWICE, matching, within CONFIRM_WINDOW_MS, before it's
+  # trusted enough to update the held state / fire an HA event. One per field, independent of
+  # the others. See the on_packet handler below and docs/remote-capture-protocol.md.
+  - id: pending_power_value
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: pending_power_count
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: pending_power_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: pending_speed_value
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: pending_speed_count
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: pending_speed_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: pending_timer_value
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: pending_timer_count
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: pending_timer_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
 ####################################################################################################
 # Set these pin numbers to the ESP32 pins corresponding to how you wired up your CC1101
 # chip. If you used the default SPI pins you might only need to set the two in the cc1101
@@ -126,10 +172,21 @@ cc1101:
           // differing from what we last held for that field. Do NOT reintroduce a time-window
           // debounce here -- a real heartbeat re-announcement several seconds later is
           // indistinguishable from "a new press of the same value" under any fixed time window;
-          // only comparing against the held per-field value gets this right. See
-          // docs/remote-capture-protocol.md for how this was discovered.
+          // only comparing against the held per-field value gets this right.
+          //
+          // A single reading is not enough to trust, though: the receiver occasionally decodes
+          // garbage with the CORRECT remote ID but a corrupted command byte, which can
+          // coincidentally land on a byte that's a real, valid value for a field -- purely
+          // because of which bit flipped. A real transmission always repeats (3x per value, by
+          // the protocol's own convention), so before a newly-differing value updates the held
+          // state / fires an event, it must be seen TWICE, matching, within CONFIRM_WINDOW_MS --
+          // see the pending_*_value/count/ms globals above. A non-matching reading in between
+          // just starts its own fresh candidate (for whichever field it belongs to); it does not
+          // invalidate a value that's already confirmed. See docs/remote-capture-protocol.md for
+          // the capture evidence behind both of these rules.
 
-          static const uint32_t SELF_ECHO_WINDOW_MS = 500;  // tune after running the capture protocol
+          static const uint32_t SELF_ECHO_WINDOW_MS = 500;   // tune after running the capture protocol
+          static const uint32_t CONFIRM_WINDOW_MS = 1500;    // covers same-burst repeats + one heartbeat cycle
 
           uint32_t now_ms = millis();
           uint8_t cmd = x[4];
@@ -185,39 +242,75 @@ cc1101:
           // status byte of its own. See docs/remote-capture-protocol.md.
           if (cmd == 0xbf || cmd == 0x80 || cmd == 0xb0) {
             uint8_t normalized = (cmd == 0xbf) ? 0xbf : 0x80;
-            if (normalized != id(power_state)) {
-              id(power_state) = normalized;
-              id(quietcool_remote_event).trigger(normalized == 0xbf ? "on" : "off");
+            if (normalized == id(power_state)) {
+              return;  // heartbeat re-confirming already-accepted state
+            }
+            if (id(pending_power_count) > 0 && id(pending_power_value) == normalized &&
+                (now_ms - id(pending_power_ms)) <= CONFIRM_WINDOW_MS) {
+              id(pending_power_count) += 1;
+              if (id(pending_power_count) >= 2) {
+                id(power_state) = normalized;
+                id(quietcool_remote_event).trigger(normalized == 0xbf ? "on" : "off");
+                id(pending_power_count) = 0;
+              }
+            } else {
+              id(pending_power_value) = normalized;
+              id(pending_power_count) = 1;
+              id(pending_power_ms) = now_ms;
             }
             return;
           }
 
           // ---- SPEED field ------------------------------------------------------------------
           if (cmd == 0x1f || cmd == 0x2f || cmd == 0x3f) {
-            if (cmd != id(speed_state)) {
-              id(speed_state) = cmd;
-              std::string token = (cmd == 0x1f) ? "low" : (cmd == 0x2f) ? "medium" : "high";
-              id(quietcool_remote_event).trigger(token);
+            if (cmd == id(speed_state)) {
+              return;  // heartbeat re-confirming already-accepted state
+            }
+            if (id(pending_speed_count) > 0 && id(pending_speed_value) == cmd &&
+                (now_ms - id(pending_speed_ms)) <= CONFIRM_WINDOW_MS) {
+              id(pending_speed_count) += 1;
+              if (id(pending_speed_count) >= 2) {
+                id(speed_state) = cmd;
+                std::string token = (cmd == 0x1f) ? "low" : (cmd == 0x2f) ? "medium" : "high";
+                id(quietcool_remote_event).trigger(token);
+                id(pending_speed_count) = 0;
+              }
+            } else {
+              id(pending_speed_value) = cmd;
+              id(pending_speed_count) = 1;
+              id(pending_speed_ms) = now_ms;
             }
             return;
           }
 
           // ---- TIMER field ------------------------------------------------------------------
           if (cmd == 0x91 || cmd == 0x92 || cmd == 0x94 || cmd == 0x98 || cmd == 0x9c || cmd == 0x9f) {
-            if (cmd != id(timer_state)) {
-              id(timer_state) = cmd;
-              std::string token;
-              if (cmd == 0x91) token = "timer_1h";
-              else if (cmd == 0x92) token = "timer_2h";
-              else if (cmd == 0x94) token = "timer_4h";
-              else if (cmd == 0x98) token = "timer_8h";
-              else if (cmd == 0x9c) token = "timer_12h";
-              // 0x9f ("no timer") has no HA token of its own -- it isn't a duration to hold,
-              // it's the absence of one. Held state above still updates so a later real timer
-              // press correctly detects the transition back into a duration.
-              if (!token.empty()) {
-                id(quietcool_remote_event).trigger(token);
+            if (cmd == id(timer_state)) {
+              return;  // heartbeat re-confirming already-accepted state
+            }
+            if (id(pending_timer_count) > 0 && id(pending_timer_value) == cmd &&
+                (now_ms - id(pending_timer_ms)) <= CONFIRM_WINDOW_MS) {
+              id(pending_timer_count) += 1;
+              if (id(pending_timer_count) >= 2) {
+                id(timer_state) = cmd;
+                std::string token;
+                if (cmd == 0x91) token = "timer_1h";
+                else if (cmd == 0x92) token = "timer_2h";
+                else if (cmd == 0x94) token = "timer_4h";
+                else if (cmd == 0x98) token = "timer_8h";
+                else if (cmd == 0x9c) token = "timer_12h";
+                // 0x9f ("no timer") has no HA token of its own -- it isn't a duration to hold,
+                // it's the absence of one. Held state above still updates (once confirmed) so a
+                // later real timer press correctly detects the transition back into a duration.
+                if (!token.empty()) {
+                  id(quietcool_remote_event).trigger(token);
+                }
+                id(pending_timer_count) = 0;
               }
+            } else {
+              id(pending_timer_value) = cmd;
+              id(pending_timer_count) = 1;
+              id(pending_timer_ms) = now_ms;
             }
             return;
           }

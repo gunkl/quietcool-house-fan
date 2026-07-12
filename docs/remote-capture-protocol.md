@@ -83,8 +83,49 @@ Confirmed twice more in later captures: a lone `0xbf` (power) interspersed mid-r
 (speed) repeats during an On/High sequence, and `0x9f` (timer=none) continuing to repeat
 several times even while the fan sat steady at On/Low with nothing timer-related pressed. All
 three fields free-run their heartbeat continuously and independently of each other and of
-power state — not just the field that most recently changed. The edge-triggered design already
-handles this correctly with no changes needed.
+power state — not just the field that most recently changed. The edge-triggered design handles
+this correctly as far as *repeats of an already-held value* go; see the next section for why a
+single differing reading still isn't enough to trust on its own.
+
+## Multi-reception confirmation: a single reading is not enough
+
+A generic problem surfaced across several capture sessions: the receiver occasionally decodes a
+packet with the **correct remote ID but a corrupted command byte**, and that corrupted byte can
+coincidentally land on a byte that's a real, valid value for a field — purely because of which
+bit flipped. This is exactly what made `0xBF` briefly look like a possible corruption of `0x3F`
+in an earlier draft of this document (see above) — a single ambiguous reading, with no way to
+tell real from corrupted without a dedicated follow-up test.
+
+**The fix, generalized:** since a real transmission always repeats (3× per value, per the
+protocol's own convention), `component.yaml`'s `on_packet` now requires a value to be seen
+**twice, matching, within `CONFIRM_WINDOW_MS` (1500ms)** before it updates the held state or
+fires an HA event — on top of the existing edge-trigger (a value equal to what's already held is
+always just a heartbeat, handled as before). A `pending_<field>_value/count/ms` global per field
+tracks a candidate in progress:
+
+- First differing reading of a field → becomes the pending candidate (count=1).
+- A second reading of the *same* value within the window → confirmed: held state updates, event
+  fires, pending resets.
+- A differing reading in between (e.g. a corrupted byte for the *same* field, or a real reading
+  for a *different* field, which routes independently) → does not invalidate an
+  already-confirmed value; it only starts its *own* fresh candidate for whichever field it
+  belongs to.
+- A candidate that never gets a second matching reading within the window is silently abandoned
+  (the same window check that confirms a match also naturally lets a stale candidate expire —
+  no separate expiry step needed).
+
+**1500ms was chosen from observed timing**: genuine same-burst repeats land 70–260ms apart; the
+heartbeat gap between separate re-announcement bursts has been observed up to ~950ms–1s. 1500ms
+comfortably covers both "two hits in the same burst" and "one hit now, one hit on the very next
+heartbeat cycle," while still requiring the same corrupted byte to coincidentally land twice for
+noise to ever be falsely accepted — a much rarer event than a single stray misread.
+
+This resolves the `0xBF`/`0x3F` ambiguity (and similar cases, like the isolated `0xB4` and the
+`0x74`/`0x8d`/`0x14` interference cluster seen in later captures) generically going forward — no
+more one-off dedicated tests needed to settle whether a single reading was real. Applies
+uniformly to all three fields, including `timer=none` (`0x9F`), which has no HA token of its own
+but still needs its held state confirmed correctly so a later real timer duration is detected as
+a genuine change.
 
 ## Original capture procedure (for reference / re-verification on other hardware)
 
