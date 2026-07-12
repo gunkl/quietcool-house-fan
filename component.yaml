@@ -264,7 +264,9 @@ cc1101:
               id(pending_power_count) += 1;
               if (id(pending_power_count) >= 2) {
                 id(power_state) = normalized;
-                id(quietcool_remote_event).trigger(normalized == 0xbf ? "on" : "off");
+                std::string token = (normalized == 0xbf) ? "on" : "off";
+                ESP_LOGI("quietcool-fan", "Power: CONFIRMED 0x%02x -> firing event '%s'", normalized, token.c_str());
+                id(quietcool_remote_event).trigger(token);
                 id(pending_power_count) = 0;
               }
             } else if (id(pending_power_count) > 0 && power_age_ms <= SAME_BURST_TOLERANCE_MS) {
@@ -273,6 +275,7 @@ cc1101:
               ESP_LOGD("quietcool-fan", "Power: ignoring mismatched 0x%02x within same-burst tolerance", cmd);
             } else {
               // No candidate, or the mismatch is late enough to be a genuinely new value.
+              ESP_LOGD("quietcool-fan", "Power: new candidate 0x%02x, awaiting confirmation", normalized);
               id(pending_power_value) = normalized;
               id(pending_power_count) = 1;
               id(pending_power_ms) = now_ms;
@@ -293,6 +296,7 @@ cc1101:
               if (id(pending_speed_count) >= 2) {
                 id(speed_state) = cmd;
                 std::string token = (cmd == 0x1f) ? "low" : (cmd == 0x2f) ? "medium" : "high";
+                ESP_LOGI("quietcool-fan", "Speed: CONFIRMED 0x%02x -> firing event '%s'", cmd, token.c_str());
                 id(quietcool_remote_event).trigger(token);
                 id(pending_speed_count) = 0;
               }
@@ -303,6 +307,7 @@ cc1101:
               ESP_LOGD("quietcool-fan", "Speed: ignoring mismatched 0x%02x within same-burst tolerance", cmd);
             } else {
               // No candidate, or the mismatch is late enough to be a genuinely new value.
+              ESP_LOGD("quietcool-fan", "Speed: new candidate 0x%02x, awaiting confirmation", cmd);
               id(pending_speed_value) = cmd;
               id(pending_speed_count) = 1;
               id(pending_speed_ms) = now_ms;
@@ -332,7 +337,10 @@ cc1101:
                 // it's the absence of one. Held state above still updates (once confirmed) so a
                 // later real timer press correctly detects the transition back into a duration.
                 if (!token.empty()) {
+                  ESP_LOGI("quietcool-fan", "Timer: CONFIRMED 0x%02x -> firing event '%s'", cmd, token.c_str());
                   id(quietcool_remote_event).trigger(token);
+                } else {
+                  ESP_LOGI("quietcool-fan", "Timer: CONFIRMED 0x%02x (no timer) -- held state updated, no HA event", cmd);
                 }
                 id(pending_timer_count) = 0;
               }
@@ -342,6 +350,7 @@ cc1101:
               ESP_LOGD("quietcool-fan", "Timer: ignoring mismatched 0x%02x within same-burst tolerance", cmd);
             } else {
               // No candidate, or the mismatch is late enough to be a genuinely new value.
+              ESP_LOGD("quietcool-fan", "Timer: new candidate 0x%02x, awaiting confirmation", cmd);
               id(pending_timer_value) = cmd;
               id(pending_timer_count) = 1;
               id(pending_timer_ms) = now_ms;
