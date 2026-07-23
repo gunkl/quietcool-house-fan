@@ -61,25 +61,47 @@ The following are the transmit settings for the signals:
 
 Each packet is sent 3 times, separated by 70ms. The command codes are:
 
-| Command       | Value | Confidence |
-|---------------|-------|------------|
-| Wake          | 0x66  | Confirmed |
-| Power: On     | 0xBF  | Very likely — confirmed with correct remote ID in live capture, not yet from a dedicated isolated press test |
-| Power: Off    | 0x80  | Confirmed — dedicated isolated capture |
-| Speed: Low    | 0x1F  | Confirmed |
-| Speed: Medium | 0x2F  | **Untested/assumed** — falls directly between Low and High in the speed family; this fan is 2-speed and can't exercise it, documented as if it functioned |
-| Speed: High   | 0x3F  | Confirmed |
-| Timer: 1h     | 0x91  | Confirmed |
-| Timer: 2h     | 0x92  | Confirmed |
-| Timer: 4h     | 0x94  | Confirmed |
-| Timer: 8h     | 0x98  | Confirmed |
-| Timer: 12h    | 0x9C  | Confirmed |
-| Timer: None   | 0x9F  | Confirmed |
+| Command                    | Value | Confidence |
+|----------------------------|-------|------------|
+| Wake                       | 0x66  | Confirmed |
+| Power: On (speed=high ctx) | 0xBF  | Confirmed — see "speed-context flag bit" below |
+| Power: Off (action)        | 0x80  | Confirmed — dedicated isolated capture |
+| Power: Off (status, speed=high ctx) | 0xB0 | Confirmed |
+| Speed: Low                 | 0x1F  | Confirmed |
+| Speed: Medium              | 0x2F  | **Untested/assumed** — falls directly between Low and High in the speed family; this fan is 2-speed and can't exercise it, documented as if it functioned |
+| Speed: High                | 0x3F  | Confirmed |
+| Timer: 1h, speed=low       | 0x91  | Confirmed |
+| Timer: 2h, speed=low       | 0x92  | Confirmed |
+| Timer: 4h, speed=low       | 0x94  | Confirmed |
+| Timer: 8h, speed=low       | 0x98  | Confirmed |
+| Timer: 12h, speed=low      | 0x9C  | Confirmed |
+| Timer: None, speed=low     | 0x9F  | Confirmed |
+| Timer: 1h, speed=medium    | 0xA1  | **Speculative** — inferred from the confirmed `0x20` speed-context bit, never directly observed (fan is 2-speed) |
+| Timer: 2h, speed=medium    | 0xA2  | **Speculative** — same basis as above |
+| Timer: 4h, speed=medium    | 0xA4  | **Speculative** — same basis as above |
+| Timer: 8h, speed=medium    | 0xA8  | **Speculative** — same basis as above |
+| Timer: 12h, speed=medium   | 0xAC  | **Speculative** — same basis as above |
+| Timer: None, speed=medium  | 0xAF  | **Speculative** — same basis as above |
+| Timer: 1h, speed=high      | 0xB1  | Confirmed — live capture (Issue: HIGH-speed timer not recognized) |
+| Timer: 2h, speed=high      | 0xB2  | Confirmed — same capture |
+| Timer: 4h, speed=high      | 0xB4  | Confirmed — same capture |
+| Timer: 8h, speed=high      | 0xB8  | Confirmed — same capture |
+| Timer: 12h, speed=high     | 0xBC  | Confirmed — same capture |
 
-The timer family fixes the high nibble at `0x9` and uses the low nibble as the literal hour
-count (`1,2,4,8,C`=12), with `F` (max) as the "no timer" sentinel — the speed family mirrors
-this by fixing the *low* nibble at `F` and varying the high nibble (`1`→low, `2`→medium,
-`3`→high).
+The timer family fixes the high nibble's low 3 bits at `0b001` (`0x9`/`0xA`/`0xB` all have
+`cmd & 0x9F == cmd`... more precisely: bit `0x08` is always set, and the low nibble is the
+literal hour count (`1,2,4,8,C`=12), with `F` (max) as the "no timer" sentinel. **The
+high nibble additionally carries a "current speed" flag bit (`0x20`)**: `0x9_` when the
+remote's currently-selected speed is LOW, `0xA_` when MEDIUM (speculative, unverified), `0xB_`
+when HIGH. This was discovered when a user reported that timer presses were recognized at LOW
+speed but silently dropped at HIGH speed — the original decode only matched the `0x9_` family,
+so every `0xB_` (HIGH-speed) timer byte fell through undecoded. See
+[docs/remote-capture-protocol.md](docs/remote-capture-protocol.md) for the full diagnosis. The
+Power On (`0xBF`) and Off-status (`0xB0`) bytes are actually this *same* status-beacon schema
+(`0x20` bit set + low nibble `0xF`/`0x0`), not an unrelated "power" family — they're just
+labeled separately here since that's the meaning Climate Advisor derives from them today. The
+speed-select family (`0x1F`/`0x2F`/`0x3F`, sent only on an explicit speed change) is a separate
+byte space entirely: low nibble fixed at `F`, high nibble `1`→low, `2`→medium, `3`→high.
 
 The original project didn't bother capturing the timer commands, since almost everyone would
 set a timer via home automation anyway. This fork adds **remote-receive** support instead — it
