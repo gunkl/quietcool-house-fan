@@ -257,12 +257,23 @@ cc1101:
           else if (cmd == 0x1f) name = "KNOWN(speed=low)";
           else if (cmd == 0x2f) name = "KNOWN(speed=medium, untested)";
           else if (cmd == 0x3f) name = "KNOWN(speed=high)";
-          else if (cmd == 0x91) name = "KNOWN(timer=1h)";
-          else if (cmd == 0x92) name = "KNOWN(timer=2h)";
-          else if (cmd == 0x94) name = "KNOWN(timer=4h)";
-          else if (cmd == 0x98) name = "KNOWN(timer=8h)";
-          else if (cmd == 0x9c) name = "KNOWN(timer=12h)";
-          else if (cmd == 0x9f) name = "KNOWN(timer=none)";
+          else if (cmd == 0x91) name = "KNOWN(timer=1h, speed=low)";
+          else if (cmd == 0x92) name = "KNOWN(timer=2h, speed=low)";
+          else if (cmd == 0x94) name = "KNOWN(timer=4h, speed=low)";
+          else if (cmd == 0x98) name = "KNOWN(timer=8h, speed=low)";
+          else if (cmd == 0x9c) name = "KNOWN(timer=12h, speed=low)";
+          else if (cmd == 0x9f) name = "KNOWN(timer=none, speed=low)";
+          else if (cmd == 0xa1) name = "KNOWN(timer=1h, speed=medium, speculative)";
+          else if (cmd == 0xa2) name = "KNOWN(timer=2h, speed=medium, speculative)";
+          else if (cmd == 0xa4) name = "KNOWN(timer=4h, speed=medium, speculative)";
+          else if (cmd == 0xa8) name = "KNOWN(timer=8h, speed=medium, speculative)";
+          else if (cmd == 0xac) name = "KNOWN(timer=12h, speed=medium, speculative)";
+          else if (cmd == 0xaf) name = "KNOWN(timer=none, speed=medium, speculative)";
+          else if (cmd == 0xb1) name = "KNOWN(timer=1h, speed=high)";
+          else if (cmd == 0xb2) name = "KNOWN(timer=2h, speed=high)";
+          else if (cmd == 0xb4) name = "KNOWN(timer=4h, speed=high)";
+          else if (cmd == 0xb8) name = "KNOWN(timer=8h, speed=high)";
+          else if (cmd == 0xbc) name = "KNOWN(timer=12h, speed=high)";
 
           ESP_LOGD("quietcool-fan", "Remote command received: 0x%02x [%s] id_match=%s (id_diff_bits=%u)",
                    cmd, name, id_match ? "yes" : "no", id_diff_bits);
@@ -358,7 +369,26 @@ cc1101:
           }
 
           // ---- TIMER field ------------------------------------------------------------------
-          if (cmd == 0x91 || cmd == 0x92 || cmd == 0x94 || cmd == 0x98 || cmd == 0x9c || cmd == 0x9f) {
+          // Issue: LOW-speed and HIGH-speed timer presses are NOT the same byte family. The
+          // remote ORs a "current speed" flag bit (0x20) into the timer status byte whenever
+          // its currently-selected speed is HIGH, so the same duration is reported as 0x9_ at
+          // LOW speed but 0xB_ at HIGH speed (confirmed via live capture: 0x91/0x92/0x94/0x98/
+          // 0x9c at LOW became 0xB1/0xB2/0xB4/0xB8/0xBC at HIGH -- each differs by exactly
+          // 0x20). The original exact-byte match only recognized the 0x9_ (LOW) family, so
+          // every HIGH-speed timer press fell through entirely undecoded and no timer_Nh event
+          // ever fired -- a deterministic decode gap, not RF noise/packet loss. Fixed by
+          // masking off the speed-context nibble and decoding the duration from the low nibble
+          // alone, so all speed contexts map to the same timer_Nh tokens. The 0xA_ (MEDIUM)
+          // family is included by inference from the same 0x20-bit pattern -- it has never
+          // been directly observed (this fan is 2-speed, so MEDIUM is unreachable), documented
+          // here as speculative per the same project convention already used for the untested
+          // 0x2F MEDIUM speed-select byte. See docs/remote-capture-protocol.md.
+          uint8_t timer_family = cmd & 0xF0;   // 0x90=speed low, 0xA0=speed medium (speculative), 0xB0=speed high
+          uint8_t timer_value = cmd & 0x0F;    // 1,2,4,8,0xC=12h, 0xF=none
+          bool is_timer_byte = (timer_family == 0x90 || timer_family == 0xA0 || timer_family == 0xB0) &&
+                                (timer_value == 0x1 || timer_value == 0x2 || timer_value == 0x4 ||
+                                 timer_value == 0x8 || timer_value == 0xC || timer_value == 0xF);
+          if (is_timer_byte) {
             if (cmd == id(timer_state)) {
               return;  // heartbeat re-confirming already-accepted state
             }
@@ -370,12 +400,12 @@ cc1101:
               if (id(pending_timer_count) >= 2) {
                 id(timer_state) = cmd;
                 std::string token;
-                if (cmd == 0x91) token = "timer_1h";
-                else if (cmd == 0x92) token = "timer_2h";
-                else if (cmd == 0x94) token = "timer_4h";
-                else if (cmd == 0x98) token = "timer_8h";
-                else if (cmd == 0x9c) token = "timer_12h";
-                // 0x9f ("no timer") has no HA token of its own -- it isn't a duration to hold,
+                if (timer_value == 0x1) token = "timer_1h";
+                else if (timer_value == 0x2) token = "timer_2h";
+                else if (timer_value == 0x4) token = "timer_4h";
+                else if (timer_value == 0x8) token = "timer_8h";
+                else if (timer_value == 0xC) token = "timer_12h";
+                // A low nibble of 0xF ("no timer") has no HA token of its own -- it isn't a duration to hold,
                 // it's the absence of one. Held state above still updates (once confirmed) so a
                 // later real timer press correctly detects the transition back into a duration.
                 if (!token.empty()) {

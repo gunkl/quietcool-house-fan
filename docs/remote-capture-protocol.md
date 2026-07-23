@@ -202,6 +202,61 @@ worth it. **This is a known, accepted limitation**: if only one copy of a genuin
 received, that press will not register, and the user may need to re-press. Revisit only if this
 proves to be a frequent, practical annoyance rather than a rare edge case.
 
+### Timer byte family is speed-context-dependent, not fixed at 0x9_ (fixed)
+
+**Symptom:** a user reported that pressing a timer button (1h/2h/4h/8h/12h) on the physical
+remote was correctly recognized by Home Assistant (`event.quietcool_remote` fired the matching
+`timer_Nh` token, and Climate Advisor's grace period honored the selected duration) when the
+remote's speed was set to LOW — but the same timer buttons produced no event at all, at any
+duration, when speed was set to HIGH. Confirmed 100% reproducible, not intermittent.
+
+**Diagnosis:** the user captured the raw command bytes directly (via the ESPHome device's
+DEBUG log) for each timer duration while at HIGH speed: `0xB1`, `0xB2`, `0xB4`, `0xB8`, `0xBC`
+for 1h/2h/4h/8h/12h respectively. Compared against the already-documented LOW-speed bytes
+(`0x91`/`0x92`/`0x94`/`0x98`/`0x9C`), each pair differs by exactly `0x20`:
+
+| Duration | @ LOW | @ HIGH | XOR |
+|---|---|---|---|
+| 1h | `0x91` | `0xB1` | `0x20` |
+| 2h | `0x92` | `0xB2` | `0x20` |
+| 4h | `0x94` | `0xB4` | `0x20` |
+| 8h | `0x98` | `0xB8` | `0x20` |
+| 12h | `0x9C` | `0xBC` | `0x20` |
+
+The remote is not sending a different protocol at HIGH — it ORs a "current speed" flag bit
+(`0x20`) into the same status byte whenever the remote's currently-selected speed is HIGH. This
+also retroactively explains why `0xBF` ("Power: On") and the already-documented `0x9F`
+("Timer: None") looked like two unrelated single-purpose bytes: they are the *same* underlying
+signal ("no timer duration held") reported at two different speed contexts, not an independent
+"power" family — `0x9F` is "timer=none, speed=low", `0xBF` is "timer=none, speed=high". The
+`0x20` bit similarly appears in `0x80`/`0xB0` (off-action vs. off-status), consistent with the
+same schema, though "off" carries no meaningful speed context of its own.
+
+`component.yaml`'s `on_packet` TIMER branch matched only the exact bytes `0x91`/`0x92`/`0x94`/
+`0x98`/`0x9c`/`0x9f` (the `0x9_` family). Every `0xB_` byte fell through to the final
+"unrecognized, not decoded" fallthrough at the bottom of the handler — logged as `UNKNOWN`,
+never reaching the TIMER field's confirm/held-state logic, so no `timer_Nh` HA event was ever
+possible while at HIGH speed. This was a deterministic decode gap, not the packet-loss/RF-noise
+issue this document's earlier section describes (that section remains a real, separate,
+accepted limitation — it just wasn't the cause here).
+
+**Fix:** the TIMER branch now masks the command byte (`cmd & 0xF0` for the family, `cmd & 0x0F`
+for the duration) and accepts the `0x90`, `0xA0` (speculative — see below), and `0xB0` families
+uniformly, decoding the `timer_Nh` token from the low nibble regardless of which family the
+byte came from. The per-field held-state/pending-confirmation logic (`timer_state`,
+`pending_timer_*`) is unchanged and still keyed on the raw byte — switching speed context while
+a timer is active causes one harmless extra re-fire of the same duration (the byte's family
+changed even though the intended duration didn't), which is not incorrect: Climate Advisor's
+`handle_fan_manual_override` is idempotent for a repeated identical duration.
+
+**The `0xA_` (MEDIUM speed context) family is included in the fix by inference, not direct
+observation.** This fan is 2-speed only, so `0xA1`/`0xA2`/`0xA4`/`0xA8`/`0xAC`/`0xAF` have never
+been captured — they're predicted purely from the confirmed `0x20`-bit pattern across the
+LOW/HIGH pair. Including them in the mask costs nothing (that byte range was otherwise unused
+and undecoded) and follows the same project convention already applied to the untested `0x2F`
+MEDIUM speed-select byte ("documented as if it functioned, per project decision"). Flagged here
+explicitly as speculative so a future capture on 3-speed hardware can confirm or correct it.
+
 ### Interpretation rule for consumers: "off" is the only explicit power-down signal
 
 Pressing the remote to resume power (with no explicit speed change) transmits `wake` plus
