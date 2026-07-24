@@ -490,7 +490,13 @@ fan:
             - script.execute:
                 id: send_command
                 command: 0xbf
-      - lambda: !lambda 'id(house_fan).speed = 2;'
+      # Default post-power-on speed is LOW (1), not HIGH (2) -- 0xbf ("power on") carries no
+      # speed selection of its own (see the status-beacon schema in
+      # docs/remote-capture-protocol.md: "On's status IS whatever Speed is currently held"),
+      # so this only needs to reflect a sane default for the local HA-reported state when
+      # turned on generically (not via an explicit speed_set). LOW matches the already-deployed
+      # device config and is the safer default (lower airflow/noise) until a real speed is set.
+      - lambda: !lambda 'id(house_fan).speed = 1;'
     on_turn_off:
       - if:
           condition:
