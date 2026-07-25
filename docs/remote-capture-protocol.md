@@ -340,6 +340,26 @@ hardware default is hardcoded to HIGH**, not a re-announcement of a previously-h
 `0xBF`→"high" ambient-sensor mapping is kept (it's empirically correct) but its justification in
 `component.yaml` now states this real mechanism instead of the retracted nibble-decode theory.
 
+### Second follow-up (gunkl/quietcool-house-fan#5): the no-timer fix above had its own gap — a stale outer heartbeat guard could suppress a genuinely new speed selection
+
+Live re-verification of the fix above found a second defect, introduced by the same fix: pressing
+a no-timer speed byte (e.g. `0x9F`) fired `low` correctly the first time, but a **later** press of
+the exact same byte — after the effective speed had been changed away and back via the dedicated
+SPEED-field bytes (`0x1F`/`0x3F`) in between — fired nothing at all, not even an ambient sensor
+update. Root cause: the TIMER branch's pre-existing outer guard, `if (cmd == timer_state) return;`,
+predates speed mattering here — it was written to say "this exact duration byte is already held,
+nothing new," which was correct when only the duration mattered. But `timer_state` and `speed_state`
+are two independently-updated held values now, and a no-timer byte can recur identically (so
+`timer_state` sees no change) while `speed_state` has genuinely drifted via the *other* byte family
+in between. The old guard returned before ever reaching the speed-firing logic, silently dropping a
+real user action.
+
+**Fix:** compute whether the byte's implied speed differs from `speed_state` *before* the early
+return, and only take the heartbeat shortcut when neither the duration nor the speed context has
+anything new to report. The existing 2-reading confirm requirement (noise immunity) is preserved —
+this only changes when the *first* reading of a repeat byte is allowed to start a fresh confirm
+cycle instead of being dismissed outright.
+
 ## Original capture procedure (for reference / re-verification on other hardware)
 
 1. **Sanity pass**: press On, Off, Low, High once each, ~5s apart — confirms the logging

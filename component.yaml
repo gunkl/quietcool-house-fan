@@ -421,8 +421,23 @@ cc1101:
                                 (timer_value == 0x1 || timer_value == 0x2 || timer_value == 0x4 ||
                                  timer_value == 0x8 || timer_value == 0xC || timer_value == 0xF);
           if (is_timer_byte) {
-            if (cmd == id(timer_state)) {
-              return;  // heartbeat re-confirming already-accepted state
+            // ==== Speed-only press, take 2 (gunkl/quietcool-house-fan#5 follow-up) ============
+            // The guard below (cmd == timer_state -> heartbeat) predates speed mattering here:
+            // it correctly says "this exact duration byte is already held, nothing new" for its
+            // ORIGINAL purpose (firing timer_Nh). But since a no-timer byte also carries speed
+            // context via the SHARED speed_state global (also written by the dedicated SPEED
+            // field above), the same raw byte can legitimately recur as a genuinely NEW speed
+            // selection if the effective speed drifted away and back via THAT other byte family
+            // in between -- timer_state never changed (same byte), but speed_state did, then
+            // reverted. Confirmed live: pressing a no-timer speed byte a second time after an
+            // intervening SPEED-field press was silently dropped by the unconditional guard
+            // before ever reaching the speed-firing logic below. Must be checked BEFORE the
+            // early return, not inside it.
+            bool is_no_timer = (timer_value == 0xF);
+            uint8_t implied_speed_byte = (timer_family == 0x90) ? 0x1f : 0x2f;  // 0xB0 never reaches here -- see POWER branch above
+            bool speed_is_stale = is_no_timer && (implied_speed_byte != id(speed_state));
+            if (cmd == id(timer_state) && !speed_is_stale) {
+              return;  // true heartbeat -- neither duration nor speed context has anything new
             }
             uint32_t timer_age_ms = now_ms - id(pending_timer_ms);
             if (id(pending_timer_count) > 0 && id(pending_timer_value) == cmd &&
@@ -469,15 +484,15 @@ cc1101:
                 if (!token.empty()) {
                   ESP_LOGI("quietcool-fan", "Timer: CONFIRMED 0x%02x -> firing event '%s'", cmd, token.c_str());
                   id(quietcool_remote_event).trigger(token);
+                } else if (implied_speed_byte != id(speed_state)) {
+                  // implied_speed_byte/speed_is_stale computed up front (see the comment at the
+                  // top of this branch) -- reused here rather than re-derived, and it's what let
+                  // us reach this confirm block at all when cmd == timer_state.
+                  id(speed_state) = implied_speed_byte;
+                  ESP_LOGI("quietcool-fan", "Timer: CONFIRMED 0x%02x (no timer) -- speed changed, firing event '%s'", cmd, speed_ctx);
+                  id(quietcool_remote_event).trigger(speed_ctx);
                 } else {
-                  uint8_t speed_byte = (timer_family == 0x90) ? 0x1f : 0x2f;  // 0x90=low, 0xA0=medium (speculative); 0xB0 never reaches here (see above)
-                  if (speed_byte != id(speed_state)) {
-                    id(speed_state) = speed_byte;
-                    ESP_LOGI("quietcool-fan", "Timer: CONFIRMED 0x%02x (no timer) -- speed changed, firing event '%s'", cmd, speed_ctx);
-                    id(quietcool_remote_event).trigger(speed_ctx);
-                  } else {
-                    ESP_LOGI("quietcool-fan", "Timer: CONFIRMED 0x%02x (no timer, speed unchanged) -- no HA event", cmd);
-                  }
+                  ESP_LOGI("quietcool-fan", "Timer: CONFIRMED 0x%02x (no timer, speed unchanged) -- no HA event", cmd);
                 }
                 id(pending_timer_count) = 0;
               }
