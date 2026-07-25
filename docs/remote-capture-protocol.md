@@ -296,6 +296,70 @@ calls in `component.yaml`'s SPEED/TIMER/POWER branches for the implementation �
 family that carries the embedded `0x20` speed-context bit, not just explicit speed-select
 presses, so the ambient reading survives a whole session even without one.
 
+### Amendment (gunkl/quietcool-house-fan#5): the events-only risk was real, but only for ONE case, and that case turned out to be load-bearing
+
+First real-hardware use of the feature above found that Climate Advisor's override-vs-comfort
+classification never actually received a speed token: this remote transmits a direct speed
+selection (e.g. "turn on at LOW") via the TIMER byte family's "no timer" nibble (`0x9F`/`0xAF`),
+not the dedicated SPEED-field bytes — and that branch, by the original pre-speed-sensor design,
+fires **no HA event at all** for the no-timer case (see "Multi-reception confirmation" above). The
+companion-event risk described in point 2 above is real, but it only applies when TWO things would
+fire from the same packet at once (e.g. a timer duration *and* a speed change together) — it does
+not apply to the no-timer case, where nothing else was ever going to fire from that packet anyway.
+
+**Fix, scoped narrowly to that one gap:** the TIMER branch's no-timer (`0x0F` nibble) case now
+fires the derived `low`/`medium` token through the *existing* `event.quietcool_remote` entity
+(same entity, same vocabulary the SPEED field already emits), edge-triggered against the shared
+`speed_state` global, instead of firing nothing. This is not a reversion of the ontology decision
+above — the ambient `text_sensor` is unchanged and still the source of truth for "what's the speed
+right now" — it's a recognition that "no timer selected" was itself being treated as "nothing
+happened," when for this remote it's frequently the *only* signal a direct speed selection ever
+produces. Timer-bearing bytes (`0x91`, `0xB2`, etc.) are unchanged — their speed context still only
+reaches the ambient sensor, not the event stream, since Climate Advisor's classification treats
+timer presence alone as sufficient to determine override intent (speed there is
+observability-only, not decision-critical), so the collision risk described above was never worth
+taking on for that case.
+
+### Correction (gunkl/quietcool-house-fan#5): the POWER branch's speed extraction was wrong for `0xB0`, right (for a different reason) for `0xBF`
+
+The original text above ("fed from every family that carries the embedded `0x20` speed-context
+bit") assumed the POWER branch's off-status byte (`0xB0`) varied with held speed the same way the
+TIMER family does. **Direct A/B capture (2026-07-25): pressing OFF while at LOW and pressing OFF
+while at HIGH both transmitted the identical byte, `0x80` (action) then `0xB0`×3 (status), with no
+variation whatsoever.** This confirms the "Resolved" note further up this document was right all
+along ("off carries no meaningful speed context of its own") — the extraction added for the
+ambient sensor contradicted an already-settled finding in this same document and has been removed.
+The ambient sensor now simply retains whatever real speed was last confirmed by the SPEED field or
+TIMER branch across an off press, which is more accurate than a fabricated re-derivation.
+
+The same capture round confirmed `0xBF` (on) reliably corresponds to HIGH — but not via a per-speed
+nibble decode (ruled out by the `0xB0` evidence above, since `0xBF`/`0xB0` are the same family).
+Pressing bare ON with no speed touched fired `0xBF` and the physical fan was HIGH, independent of
+whatever speed was held before the fan was last turned off — i.e. **this remote's power-on
+hardware default is hardcoded to HIGH**, not a re-announcement of a previously-held value. The
+`0xBF`→"high" ambient-sensor mapping is kept (it's empirically correct) but its justification in
+`component.yaml` now states this real mechanism instead of the retracted nibble-decode theory.
+
+### Second follow-up (gunkl/quietcool-house-fan#5): the no-timer fix above had its own gap — a stale outer heartbeat guard could suppress a genuinely new speed selection
+
+Live re-verification of the fix above found a second defect, introduced by the same fix: pressing
+a no-timer speed byte (e.g. `0x9F`) fired `low` correctly the first time, but a **later** press of
+the exact same byte — after the effective speed had been changed away and back via the dedicated
+SPEED-field bytes (`0x1F`/`0x3F`) in between — fired nothing at all, not even an ambient sensor
+update. Root cause: the TIMER branch's pre-existing outer guard, `if (cmd == timer_state) return;`,
+predates speed mattering here — it was written to say "this exact duration byte is already held,
+nothing new," which was correct when only the duration mattered. But `timer_state` and `speed_state`
+are two independently-updated held values now, and a no-timer byte can recur identically (so
+`timer_state` sees no change) while `speed_state` has genuinely drifted via the *other* byte family
+in between. The old guard returned before ever reaching the speed-firing logic, silently dropping a
+real user action.
+
+**Fix:** compute whether the byte's implied speed differs from `speed_state` *before* the early
+return, and only take the heartbeat shortcut when neither the duration nor the speed context has
+anything new to report. The existing 2-reading confirm requirement (noise immunity) is preserved —
+this only changes when the *first* reading of a repeat byte is allowed to start a fresh confirm
+cycle instead of being dismissed outright.
+
 ## Original capture procedure (for reference / re-verification on other hardware)
 
 1. **Sanity pass**: press On, Off, Low, High once each, ~5s apart — confirms the logging

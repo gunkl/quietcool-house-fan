@@ -321,17 +321,39 @@ cc1101:
                 ESP_LOGI("quietcool-fan", "Power: CONFIRMED 0x%02x -> firing event '%s'", normalized, token.c_str());
                 id(quietcool_remote_event).trigger(token);
                 // ==== Ambient speed sensor (Issue: Climate Advisor speed-aware remote) ====
-                // 0x80 (off, action) carries no speed-context bit -- skipped. 0xbf (on) and
-                // 0xb0 (off, status) DO carry it (same 0x20-bit schema as the TIMER family
-                // below -- see that block's comment if this ternary ever needs to change),
-                // per the documented "On's status IS whatever Speed is currently held"
-                // theory -- extrapolated from the confirmed TIMER-family pattern, not yet
-                // independently captured for this family specifically.
-                if (normalized == 0xbf || cmd == 0xb0) {
-                  uint8_t power_family = cmd & 0xF0;  // 0x90/0xA0/0xB0 (0x80 skipped above)
-                  const char *speed_ctx = (power_family == 0x90) ? "low" : (power_family == 0xA0) ? "medium" : "high";
-                  id(quietcool_speed_sensor).publish_state(speed_ctx);
-                  ESP_LOGD("quietcool-fan", "Speed sensor updated from power branch: %s", speed_ctx);
+                // 0x80 (off, action) carries no speed-context bit -- skipped, as before.
+                //
+                // 0xb0 (off, status): a prior version of this branch extracted a speed_ctx from
+                // this byte via the same 0x20-bit family mask used for TIMER, but that was an
+                // unverified extrapolation -- and it was WRONG. Confirmed via a direct A/B capture
+                // (gunkl/quietcool-house-fan#5, 2026-07-25): pressing OFF at LOW and pressing OFF
+                // at HIGH both transmit the identical byte (0xb0), proving this byte carries no
+                // speed information at all (matching what docs/remote-capture-protocol.md had
+                // already concluded before that extraction was added: "off carries no meaningful
+                // speed context of its own"). Deliberately not publishing anything here now -- the
+                // ambient sensor simply keeps whatever real speed was last confirmed by the SPEED
+                // field or the TIMER branch below, which stays correct across an off press instead
+                // of being overwritten with a fabricated value.
+                //
+                // 0xbf (on): DOES reliably mean "high" -- but not because of a per-speed nibble
+                // decode (the 0xb0 evidence above rules that out for this family). Confirmed via
+                // the same #5 capture: pressing bare ON with no speed touched fires 0xbf and the
+                // fan is physically HIGH, independent of whatever speed was held before the fan
+                // was last turned off. This remote's power-on hardware default is hardcoded to
+                // HIGH -- not a re-announcement of a held value. Kept because it's empirically
+                // correct, with the real mechanism now documented instead of the old TIMER-family
+                // extrapolation theory.
+                if (normalized == 0xbf) {
+                  id(quietcool_speed_sensor).publish_state("high");
+                  ESP_LOGD("quietcool-fan", "Speed sensor updated from power branch: high (power-on default)");
+                  // Also update the SHARED speed_state held-value (not just the ambient sensor) --
+                  // otherwise it goes stale relative to reality and the TIMER branch's speed-edge
+                  // check above (gunkl/quietcool-house-fan#5 follow-up) can wrongly treat a later
+                  // genuine LOW selection as "no change" because speed_state never learned we're
+                  // really at HIGH now. Found via log inspection, not yet independently hardware-
+                  // confirmed the way the 0xB0/0xBF findings above were -- flagging that distinction
+                  // explicitly rather than overstating confidence.
+                  id(speed_state) = 0x3f;
                 }
                 id(pending_power_count) = 0;
               }
@@ -407,8 +429,23 @@ cc1101:
                                 (timer_value == 0x1 || timer_value == 0x2 || timer_value == 0x4 ||
                                  timer_value == 0x8 || timer_value == 0xC || timer_value == 0xF);
           if (is_timer_byte) {
-            if (cmd == id(timer_state)) {
-              return;  // heartbeat re-confirming already-accepted state
+            // ==== Speed-only press, take 2 (gunkl/quietcool-house-fan#5 follow-up) ============
+            // The guard below (cmd == timer_state -> heartbeat) predates speed mattering here:
+            // it correctly says "this exact duration byte is already held, nothing new" for its
+            // ORIGINAL purpose (firing timer_Nh). But since a no-timer byte also carries speed
+            // context via the SHARED speed_state global (also written by the dedicated SPEED
+            // field above), the same raw byte can legitimately recur as a genuinely NEW speed
+            // selection if the effective speed drifted away and back via THAT other byte family
+            // in between -- timer_state never changed (same byte), but speed_state did, then
+            // reverted. Confirmed live: pressing a no-timer speed byte a second time after an
+            // intervening SPEED-field press was silently dropped by the unconditional guard
+            // before ever reaching the speed-firing logic below. Must be checked BEFORE the
+            // early return, not inside it.
+            bool is_no_timer = (timer_value == 0xF);
+            uint8_t implied_speed_byte = (timer_family == 0x90) ? 0x1f : 0x2f;  // 0xB0 never reaches here -- see POWER branch above
+            bool speed_is_stale = is_no_timer && (implied_speed_byte != id(speed_state));
+            if (cmd == id(timer_state) && !speed_is_stale) {
+              return;  // true heartbeat -- neither duration nor speed context has anything new
             }
             uint32_t timer_age_ms = now_ms - id(pending_timer_ms);
             if (id(pending_timer_count) > 0 && id(pending_timer_value) == cmd &&
@@ -432,14 +469,38 @@ cc1101:
                 else if (timer_value == 0x4) token = "timer_4h";
                 else if (timer_value == 0x8) token = "timer_8h";
                 else if (timer_value == 0xC) token = "timer_12h";
-                // A low nibble of 0xF ("no timer") has no HA token of its own -- it isn't a duration to hold,
-                // it's the absence of one. Held state above still updates (once confirmed) so a
-                // later real timer press correctly detects the transition back into a duration.
+                // A low nibble of 0xF ("no timer") has no timer_Nh token of its own -- it isn't a
+                // duration to hold, it's the absence of one. Held state above still updates (once
+                // confirmed) so a later real timer press correctly detects the transition back
+                // into a duration.
+                //
+                // ==== Speed-only press (Issue gunkl/quietcool-house-fan#5) ====================
+                // This is the ONLY way this remote transmits "the user selected a speed while the
+                // fan was off / with no timer" -- confirmed live: pressing a speed button while
+                // the fan is already ON goes through the dedicated SPEED field above (0x1F/0x3F),
+                // but selecting a speed to directly turn the fan on (or while at rest) goes through
+                // THIS byte family instead (0x9F/0xAF). The original design (pre-Climate Advisor
+                // speed-aware remote) only ever needed the *duration* out of this byte and legitimately
+                // fired nothing for the no-timer case; once Climate Advisor started needing the
+                // *speed* out of it too, that silence became a real gap -- confirmed via live CA
+                // logs showing every "Fan remote burst" line reading speed=None on this hardware.
+                // (0xB0/HIGH's no-timer byte is 0xBF, which is intercepted by the POWER branch's
+                // exact match above and never reaches here -- HIGH is unaffected by this gap.)
+                // Fire it through the SAME event entity/vocabulary the SPEED field already uses,
+                // edge-triggered against the SAME speed_state held-value, so a later explicit
+                // speed-select press of the same value correctly sees "no change" too.
                 if (!token.empty()) {
                   ESP_LOGI("quietcool-fan", "Timer: CONFIRMED 0x%02x -> firing event '%s'", cmd, token.c_str());
                   id(quietcool_remote_event).trigger(token);
+                } else if (implied_speed_byte != id(speed_state)) {
+                  // implied_speed_byte/speed_is_stale computed up front (see the comment at the
+                  // top of this branch) -- reused here rather than re-derived, and it's what let
+                  // us reach this confirm block at all when cmd == timer_state.
+                  id(speed_state) = implied_speed_byte;
+                  ESP_LOGI("quietcool-fan", "Timer: CONFIRMED 0x%02x (no timer) -- speed changed, firing event '%s'", cmd, speed_ctx);
+                  id(quietcool_remote_event).trigger(speed_ctx);
                 } else {
-                  ESP_LOGI("quietcool-fan", "Timer: CONFIRMED 0x%02x (no timer) -- held state updated, no HA event", cmd);
+                  ESP_LOGI("quietcool-fan", "Timer: CONFIRMED 0x%02x (no timer, speed unchanged) -- no HA event", cmd);
                 }
                 id(pending_timer_count) = 0;
               }
