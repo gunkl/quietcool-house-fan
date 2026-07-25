@@ -20,15 +20,42 @@ First you will need an ESP32 and a CC1101 chip. Both of these are easily availab
 
 ![ESP32 and CC1101 chip mounted on a prototyping board in a 3d printed box](images/esp32-cc1101.png "esp32-cc1101 complete")
 
-You can use the ESP32's default SPI pins or any of the digital IO pins, you'll just need to make sure the pin settings in the component YAML match how you have things wired up. Note that my CC1101 chip has a max voltage of 3.6V so make sure you don't wire it to the 5V output of the ESP32 or direct to your power supply if you're using 5V.
+You can use the ESP32's default SPI pins or any of the digital IO pins, you'll just need to make sure the pin settings match how you have things wired up. Note that my CC1101 chip has a max voltage of 3.6V so make sure you don't wire it to the 5V output of the ESP32 or direct to your power supply if you're using 5V.
 
-Once you have your hardware all squared away, you'll need [ESPHome](https://esphome.io). For most uses, you're probably using ESPHome along side [Home Assistant](https://home-assistant.io). Either way, the easiest thing to do is to launch your ESPHome dashboard and add a new device. You'll probably want to add more configuration options like wifi, Home Assistant connection, and captive portal setup to the component.yaml. Typically your ESPHome configuration will do that and you can just paste the contents of this repository's [component.yaml](component.yaml) at the end of the stuff that the new device wizard creates.
+Once you have your hardware all squared away, you'll need [ESPHome](https://esphome.io). For most uses, you're probably using ESPHome along side [Home Assistant](https://home-assistant.io). Either way, the easiest thing to do is to launch your ESPHome dashboard and add a new device — this generates a starter file with your `esphome:`/`wifi:`/`api:`/`ota:` blocks already filled in. From there, you have two ways to pull in this component:
 
-Simply change the settings in the YAML to match your pins and remote ID (see comments for how to determine remote ID if you don't know it and aren't pairing), install to the ESP32 using the ESPHome dashboard, and you should now be able to control your house fan from the ESP32 device. If you're using ESPHome in Home Assistant it should show up as a fan device. If you're not using Home Assistant you can add `web_server:` to the component YAML and navigate to the device's IP address (visible from the device logs in ESPHome) in a browser and control it from there.
+### Recommended: `packages:` + `substitutions:` (survives future updates)
+
+All of your per-device settings — remote ID, CC1101 wiring, radio frequency — live in one `substitutions:` block at the very top of [component.yaml](component.yaml). Rather than editing that file directly, add a `packages:` entry to your own dashboard file that pulls it in, and override just the values you need:
+
+```yaml
+substitutions:
+  remote_id_0: "0xcb"
+  remote_id_1: "0x00"
+  remote_id_2: "0xcc"   # your remote's actual ID -- see below for how to read it
+  remote_id_3: "0x27"
+  # Only list the ones that differ from component.yaml's own defaults --
+  # cc1101_clk_pin, cc1101_frequency, etc. are all overridable the same way.
+
+packages:
+  quietcool: github://gunkl/quietcool-house-fan/component.yaml@main
+
+esphome:
+  name: my-quietcool-fan
+  # ... rest of the wizard-generated config (wifi, api, ota, logger, etc.)
+```
+
+With this setup, "updating the firmware" is just recompiling — ESPHome pulls the latest `component.yaml` from `main` on every build, and your `substitutions:` overrides are re-applied automatically. You never touch component.yaml directly, so there's nothing to re-merge.
+
+### Alternative: paste the whole file in
+
+If you'd rather not use `packages:` (e.g. you're offline, or want to freeze a specific version), you can still paste the entire contents of [component.yaml](component.yaml) at the end of your wizard-generated file. All the values you'd ever need to change are consolidated in the `substitutions:` block at the very top of the pasted content — edit those in place, and leave everything below the "you shouldn't need to change anything below this line" marker alone. The trade-off: any time you re-paste an updated component.yaml, you'll need to re-apply your edits to that block by hand.
+
+Either way, install to the ESP32 using the ESPHome dashboard, and you should now be able to control your house fan. If you're using ESPHome in Home Assistant it should show up as a fan device. If you're not using Home Assistant you can add `web_server:` to your config and navigate to the device's IP address (visible from the device logs in ESPHome) in a browser and control it from there.
 
 ## Troubleshooting
 
-If you are able to read your remote's ID but the ESP32 isn't controlling your fan, try changing the frequency value in the component YAML. The CC1101 chips aren't perfect and so their centers may not be dialed in out of the box. Increase or decrease the value 0.01MHz at a time and retry. One user reported theirs started working at 433.96MHz so try stepping it up to 0.1MHz in either direction and if it still doesn't work, let me know by submitting an Issue here or commenting on the [Home Assisant community thread](https://community.home-assistant.io/t/quietcool-whole-house-fan-rf-glass-remote-integration/1012030?u=thadd).
+If you are able to read your remote's ID but the ESP32 isn't controlling your fan, try changing `cc1101_frequency` (in your `substitutions:` overrides, or directly in component.yaml if you're using the paste-in approach). The CC1101 chips aren't perfect and so their centers may not be dialed in out of the box. Increase or decrease the value 0.01MHz at a time and retry. One user reported theirs started working at 433.96MHz so try stepping it up to 0.1MHz in either direction and if it still doesn't work, let me know by submitting an Issue here or commenting on the [Home Assisant community thread](https://community.home-assistant.io/t/quietcool-whole-house-fan-rf-glass-remote-integration/1012030?u=thadd).
 
 # Reverse Engineering the QuietCool RF Protocol
 

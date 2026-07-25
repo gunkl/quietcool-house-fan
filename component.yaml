@@ -1,4 +1,33 @@
 ####################################################################################################
+# Per-device settings (Issue #7): every value YOU need to change lives here, in one place. If your
+# ESPHome dashboard file pulls this in via `packages:` (see README "Quickstart"), put your real
+# values in a `substitutions:` block in YOUR file instead of editing this one -- your overrides win,
+# and pulling a future update of this file (a new git ref, or just recompiling against `@main`)
+# never touches your customization again. If you're using the older "paste the whole file in"
+# approach instead, these are still the only lines you need to edit -- just do it here rather than
+# hunting through the fields below, which no longer hold literal values.
+####################################################################################################
+substitutions:
+  # Your remote's ID, one byte per key (see the comment further down for how to read this from the
+  # logs). Defaults below are just this repo's own placeholder/example values.
+  remote_id_0: "0xcb"
+  remote_id_1: "0x00"
+  remote_id_2: "0xd5"
+  remote_id_3: "0x12"
+  # Set to "true" to have the ESP learn its paired remote's ID from the next button press instead
+  # of using the four values above. See the comment further down for details.
+  autoset_remote_default: "false"
+  # CC1101 wiring -- change to match how you wired your ESP32 to the CC1101 chip.
+  cc1101_clk_pin: "18"
+  cc1101_mosi_pin: "6"
+  cc1101_miso_pin: "16"
+  cc1101_cs_pin: "4"
+  cc1101_gdo0_pin: "3"
+  # CC1101 chips aren't perfectly centered out of the box -- if pairing/receiving doesn't work,
+  # try nudging this 0.01MHz at a time. 433.96MHz has worked for at least one other user.
+  cc1101_frequency: "433.92MHz"
+
+####################################################################################################
 # Boot guard (Issue #1): prevents this ESP from TRANSMITTING to the physical fan on boot.
 #
 # The `fan:` template platform below has restore_mode: RESTORE_DEFAULT_OFF, which restores the
@@ -24,41 +53,32 @@ globals:
     restore_value: false
     initial_value: 'false'
 
+  # Your remote's ID -- see the `substitutions:` block at the top of this file. If you don't know
+  # your ID, open up the ESPHome logger and push any button on your remote (if you just wake up
+  # your remote it should send the command "0x66", the wakeup command). In the logs you'll see:
+  #
+  # [15:59:14.560][D][quietcool-fan:060]: Remote command received: 0x66
+  # [15:59:14.560][D][quietcool-fan:061]:          from remote ID: [0xcb, 0x00, 0xa0, 0xcf]
+  #
+  # Set remote_id_0..3 (in the substitutions block) to those four values.
+  #
+  # Note that you should be able to put your fan in pairing mode and then tell ESPHome to turn
+  # it on which should make it learn whatever default code is here. You should be able to but
+  # I haven't tested it because my fan is hard to get to.
   - id: remote_id
     type: 'uint8_t[4]'
     restore_value: true
+    initial_value: '{${remote_id_0}, ${remote_id_1}, ${remote_id_2}, ${remote_id_3}}'
 
-####################################################################################################
-# Change these values to your remote's ID. If you don't know your ID, open up the ESPHome
-# logger and push any button on your remote (if you just wake up your remote it should 
-# send the command "0x66" which is the wakeup command). In the logs you'll see something 
-# like this entry:
-#
-# [15:59:14.560][D][quietcool-fan:060]: Remote command received: 0x66
-# [15:59:14.560][D][quietcool-fan:061]:          from remote ID: [0xcb, 0x00, 0xa0, 0xcf]
-#
-# Copy the values inside the square brackets and paste them here (note the logs have square
-# brackets and this needs curly). 
-#
-# Note that you should be able to put your fan in pairing mode and then tell ESPHome to turn
-# it on which should make it learn whatever default code is here. You should be able to but
-# I haven't tested it because my fan is hard to get to.
-####################################################################################################
-    initial_value: '{0xcb, 0x00, 0xd5, 0x12}'
-
-
+  # If you can't view the logs or don't want to, you can have this module learn the remote ID when
+  # it starts up. Set autoset_remote_default to "true" (in the substitutions block) and shortly
+  # after your ESP boots, press a button on your remote (or just wake it). The ESP will then retain
+  # that ID as long as it has power (it should try to retain it after a power outage, but it's not
+  # a guarantee and I'm not sure what will happen during software updates).
   - id: autoset_remote
     type: bool
     restore_value: true
-
-####################################################################################################
-# If you can't view the logs or don't want to, you can have this module learn the remote ID
-# when it starts up. To do that, set this value to "true" and then shortly after your ESP
-# boots, press a button on your remote (or just wake it). The ESP will then retain that ID
-# as long as it has power (it should try to retain it after a power outage, but it's not
-# a guarantee and I'm not sure what will happen during software updates).
-####################################################################################################
-    initial_value: 'false'
+    initial_value: '${autoset_remote_default}'
 
   # -- Remote-receive support (Issue #1) -----------------------------------------------------
   # Tracks the last command WE transmitted (via the send_command script below) and when, so a
@@ -148,28 +168,21 @@ globals:
     initial_value: '0'
 
 ####################################################################################################
-# Set these pin numbers to the ESP32 pins corresponding to how you wired up your CC1101
-# chip. If you used the default SPI pins you might only need to set the two in the cc1101
-# section, but it doesn't hurt to be explicit.
+# ESP32-to-CC1101 wiring and radio frequency -- see the `substitutions:` block at the top of this
+# file to change these for your hardware (cc1101_clk_pin/cc1101_mosi_pin/cc1101_miso_pin/
+# cc1101_cs_pin/cc1101_gdo0_pin/cc1101_frequency). If pairing/receiving doesn't work out of the
+# box, nudging cc1101_frequency 0.01MHz at a time is the most common fix -- CC1101 chips aren't
+# perfectly centered from the factory. 433.96MHz has worked for at least one other user.
 ####################################################################################################
 spi:
-  clk_pin: 18
-  mosi_pin: 6
-  miso_pin: 16
+  clk_pin: ${cc1101_clk_pin}
+  mosi_pin: ${cc1101_mosi_pin}
+  miso_pin: ${cc1101_miso_pin}
 
 cc1101:
-  cs_pin: 4
-  gdo0_pin: 3
-
-####################################################################################################
-# CC1101 chips might not have perfect center frequencies. If yours doesn't work out when you start
-# off, try setting this parameter up or down to dial it in. Several users on the Home Assistant
-# community have reported that the default didn't work for them and they had to change this value.
-# The lines commented out are frequencies verified to work by other testers so start with those. 
-####################################################################################################
-  frequency: 433.92MHz
-#  frequency: 433.94MHz
-#  frequency: 433.96MHz
+  cs_pin: ${cc1101_cs_pin}
+  gdo0_pin: ${cc1101_gdo0_pin}
+  frequency: ${cc1101_frequency}
 
 ####################################################################################################
 # You shouldn't need to change anything below this line. See the README if you want details
