@@ -269,6 +269,33 @@ is the only explicit, authoritative power-down signal; receipt of *any* other ev
 `handle_remote_command` design should derive "the fan is on" from any non-off event, not wait
 specifically for an `"on"` token.
 
+## Ambient speed sensor: a separate entity, not a companion event (Climate Advisor speed-aware remote)
+
+Climate Advisor wanted to detect and respect the remote's speed selection, not just react to
+timer presses. The first proposal was to make `on_packet` fire a *companion* speed event
+alongside whatever else confirms on a given packet, so every event carries full speed context.
+That mechanism was rejected in favor of a separate `text_sensor.quietcool_speed` entity, for two
+reasons:
+
+1. **Ontology**: a press and a reading are different kinds of information. `event.quietcool_remote`
+   correctly models "the user just did something" (discrete, edge-triggered). What CA actually
+   needed for override-vs-comfort classification was "what's the speed right now" — a
+   continuously-true *state*, not a notification. Firing more events would have smeared a state
+   fact into a stream designed for presses.
+2. **Concrete risk with the events-only approach**: firing two `.trigger()` calls inside the same
+   `on_packet` invocation (e.g. a confirmed `off` plus a synthetic companion `high`) risks landing
+   on the exact same HA `state` timestamp, which is EXACTLY the value Climate Advisor's own
+   `_last_fan_remote_event_ts` dedup guard (Issue #495 — see the "Interpretation rule" section
+   above) compares against to filter stale unavailable→restore re-announcements. A same-timestamp
+   companion event could be silently swallowed by machinery built for an unrelated purpose.
+
+A separate entity sidesteps both: zero change to the existing event entity's schema/semantics
+(old consumers unaffected), and the ambient sensor's current value is always live-readable with
+no dependency on event-dedup timing at all. See `text_sensor.quietcool_speed`'s `publish_state()`
+calls in `component.yaml`'s SPEED/TIMER/POWER branches for the implementation — fed from every
+family that carries the embedded `0x20` speed-context bit, not just explicit speed-select
+presses, so the ambient reading survives a whole session even without one.
+
 ## Original capture procedure (for reference / re-verification on other hardware)
 
 1. **Sanity pass**: press On, Off, Low, High once each, ~5s apart — confirms the logging

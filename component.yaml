@@ -320,6 +320,19 @@ cc1101:
                 std::string token = (normalized == 0xbf) ? "on" : "off";
                 ESP_LOGI("quietcool-fan", "Power: CONFIRMED 0x%02x -> firing event '%s'", normalized, token.c_str());
                 id(quietcool_remote_event).trigger(token);
+                // ==== Ambient speed sensor (Issue: Climate Advisor speed-aware remote) ====
+                // 0x80 (off, action) carries no speed-context bit -- skipped. 0xbf (on) and
+                // 0xb0 (off, status) DO carry it (same 0x20-bit schema as the TIMER family
+                // below -- see that block's comment if this ternary ever needs to change),
+                // per the documented "On's status IS whatever Speed is currently held"
+                // theory -- extrapolated from the confirmed TIMER-family pattern, not yet
+                // independently captured for this family specifically.
+                if (normalized == 0xbf || cmd == 0xb0) {
+                  uint8_t power_family = cmd & 0xF0;  // 0x90/0xA0/0xB0 (0x80 skipped above)
+                  const char *speed_ctx = (power_family == 0x90) ? "low" : (power_family == 0xA0) ? "medium" : "high";
+                  id(quietcool_speed_sensor).publish_state(speed_ctx);
+                  ESP_LOGD("quietcool-fan", "Speed sensor updated from power branch: %s", speed_ctx);
+                }
                 id(pending_power_count) = 0;
               }
             } else if (id(pending_power_count) > 0 && power_age_ms <= SAME_BURST_TOLERANCE_MS) {
@@ -351,6 +364,11 @@ cc1101:
                 std::string token = (cmd == 0x1f) ? "low" : (cmd == 0x2f) ? "medium" : "high";
                 ESP_LOGI("quietcool-fan", "Speed: CONFIRMED 0x%02x -> firing event '%s'", cmd, token.c_str());
                 id(quietcool_remote_event).trigger(token);
+                // Ambient speed sensor (Issue: Climate Advisor speed-aware remote) -- an
+                // explicit speed-select press is the simplest, most direct source: token
+                // is already exactly "low"/"medium"/"high".
+                id(quietcool_speed_sensor).publish_state(token);
+                ESP_LOGD("quietcool-fan", "Speed sensor updated from speed branch: %s", token.c_str());
                 id(pending_speed_count) = 0;
               }
             } else if (id(pending_speed_count) > 0 && speed_age_ms <= SAME_BURST_TOLERANCE_MS) {
@@ -399,6 +417,15 @@ cc1101:
               id(pending_timer_count) += 1;
               if (id(pending_timer_count) >= 2) {
                 id(timer_state) = cmd;
+                // Ambient speed sensor (Issue: Climate Advisor speed-aware remote) -- every
+                // CONFIRMED timer-family byte also carries the current speed context in its
+                // high nibble (timer_family, already computed above), regardless of whether
+                // an HA timer_Nh event fires for this specific value. Update unconditionally
+                // so the ambient sensor reflects reality even during a run of pure timer
+                // presses with no explicit speed-select press in between.
+                const char *speed_ctx = (timer_family == 0x90) ? "low" : (timer_family == 0xA0) ? "medium" : "high";
+                id(quietcool_speed_sensor).publish_state(speed_ctx);
+                ESP_LOGD("quietcool-fan", "Speed sensor updated from timer branch: %s", speed_ctx);
                 std::string token;
                 if (timer_value == 0x1) token = "timer_1h";
                 else if (timer_value == 0x2) token = "timer_2h";
@@ -553,4 +580,19 @@ event:
       - "timer_4h"
       - "timer_8h"
       - "timer_12h"
+
+####################################################################################################
+# Ambient current-speed sensor (Climate Advisor speed-aware remote integration): reports the
+# firmware's already-internally-tracked current speed as a continuously-readable STATE, distinct
+# from the event entity above (which reports discrete PRESSES). Fed from all three status-beacon
+# byte families that carry the embedded speed-context bit (see on_packet's SPEED/TIMER/POWER
+# branches) so it reflects reality even in a session with no explicit speed-select press --
+# e.g. a run of pure timer presses, or a plain on/off with no speed button touched at all.
+# Purely additive: zero change to the event entity's existing schema/semantics above.
+####################################################################################################
+text_sensor:
+  - platform: template
+    name: "QuietCool Speed"
+    id: quietcool_speed_sensor
+    icon: "mdi:fan"
 
