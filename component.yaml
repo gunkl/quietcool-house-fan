@@ -346,6 +346,14 @@ cc1101:
                 if (normalized == 0xbf) {
                   id(quietcool_speed_sensor).publish_state("high");
                   ESP_LOGD("quietcool-fan", "Speed sensor updated from power branch: high (power-on default)");
+                  // Also update the SHARED speed_state held-value (not just the ambient sensor) --
+                  // otherwise it goes stale relative to reality and the TIMER branch's speed-edge
+                  // check above (gunkl/quietcool-house-fan#5 follow-up) can wrongly treat a later
+                  // genuine LOW selection as "no change" because speed_state never learned we're
+                  // really at HIGH now. Found via log inspection, not yet independently hardware-
+                  // confirmed the way the 0xB0/0xBF findings above were -- flagging that distinction
+                  // explicitly rather than overstating confidence.
+                  id(speed_state) = 0x3f;
                 }
                 id(pending_power_count) = 0;
               }
