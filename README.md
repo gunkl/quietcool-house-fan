@@ -109,6 +109,16 @@ decodes what the *physical wall remote* sends (including the timer buttons) and 
 Home Assistant as `event.quietcool_remote`, so a person's direct request to the remote (e.g.
 "run for 8 hours") is observable, not just commands sent by the ESP itself.
 
+**Ambient speed sensor (Climate Advisor speed-aware remote integration):** in addition to the
+`event.quietcool_remote` entity above (which reports discrete *presses*), this fork also exposes
+a `text_sensor.quietcool_speed` reporting the firmware's already-internally-tracked current
+speed as a continuously-readable *state*. It's fed from the same speed-context bit embedded in
+every status-beacon byte (speed, timer, AND power families — see the packet-format table above),
+not just explicit speed-select presses, so it stays accurate across a whole session even if the
+user never presses a dedicated speed button. Purely additive: zero change to the event entity's
+schema or semantics. See [docs/remote-capture-protocol.md](docs/remote-capture-protocol.md) for
+why a separate entity was chosen over overloading the event stream.
+
 **Important protocol characteristic:** the remote is a periodic-status *beacon*, not a
 burst-per-press transmitter — after any single interaction it re-broadcasts its full current
 status (power, speed, timer) for several seconds. `component.yaml`'s `on_packet` handler
