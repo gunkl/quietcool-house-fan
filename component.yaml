@@ -26,6 +26,11 @@ substitutions:
   # CC1101 chips aren't perfectly centered out of the box -- if pairing/receiving doesn't work,
   # try nudging this 0.01MHz at a time. 433.96MHz has worked for at least one other user.
   cc1101_frequency: "433.92MHz"
+  # Speed the fan runs at when it's turned on WITHOUT a speed being chosen (Issue #9) -- e.g. a
+  # plain on/off toggle, or an automation calling fan.turn_on with no percentage. "1" = LOW,
+  # "2" = HIGH. Choosing a speed explicitly (e.g. picking HIGH in the HA fan card) always wins
+  # over this default. "1" (LOW) preserves this component's behavior from before this setting.
+  fan_default_speed: "1"
 
 ####################################################################################################
 # Boot guard (Issue #1): prevents this ESP from TRANSMITTING to the physical fan on boot.
@@ -44,6 +49,18 @@ esphome:
   on_boot:
     priority: -100    # after other components have finished their own setup/restore
     then:
+      - lambda: |-
+          static_assert(${fan_default_speed} >= 1 && ${fan_default_speed} <= 2,
+                        "fan_default_speed must be 1 (LOW) or 2 (HIGH)");
+          // Issue #9/#10: while OFF, the fan entity's speed field holds fan_default_speed (see
+          // on_turn_off below). Re-apply it here, right after restore, so the next plain turn-on
+          // uses the configured default. This covers a fresh install, a device upgraded from an
+          // older version (which persisted speed=0 while off), and one whose fan_default_speed
+          // was just changed. Not published: nothing transmits. HA picks the value up on its next
+          // state sync (an already-connected HA may show 0% until then, which is cosmetic only).
+          if (!id(house_fan).state) {
+            id(house_fan).speed = ${fan_default_speed};
+          }
       - delay: 2s      # comfortably longer than template-entity restore/apply takes
       - lambda: 'id(booted_up) = true;'
 
@@ -90,6 +107,14 @@ globals:
     initial_value: '0'
   - id: last_sent_command_ms
     type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  # Speed level (1=LOW, 2=HIGH) we last TRANSMITTED since the fan was last turned on; 0 = none
+  # since the last turn-off/boot. Lets on_speed_set skip re-sending a speed byte that on_turn_on
+  # already sent in the same state update (Issue #10). See the fan: section below.
+  - id: commanded_speed
+    type: int
     restore_value: false
     initial_value: '0'
 
@@ -574,6 +599,17 @@ script:
             - id(remote_id)[2]
             - id(remote_id)[3]
 
+  # The one place a fan speed level is turned into its RF speed-select byte (Issue #10).
+  - id: send_speed
+    mode: queued
+    parameters:
+      level: int
+    then:
+      - lambda: 'id(commanded_speed) = level;'
+      - script.execute:
+          id: send_command
+          command: !lambda 'return level >= 2 ? 0x3f : 0x1f;'
+
 fan:
   - platform: template
     name: "quietcool whole house fan"
@@ -583,6 +619,22 @@ fan:
     # Every transmit below is gated on id(booted_up) (see the boot guard at the top of this file)
     # so that RESTORE_DEFAULT_OFF's boot-time state replay updates the entity's reported state
     # without re-commanding the physical fan. Only genuine post-boot triggers actually transmit.
+    #
+    # Default speed vs. an explicitly chosen speed (Issues #9, #10). ESPHome's fan core
+    # (FanCall::validate_) turns a plain "turn on" into "turn on at 100%" whenever the entity's
+    # speed field is 0. Earlier versions of this file zeroed speed on every turn-off, and then
+    # forced speed = 1 inside on_turn_on. That made a plain turn-on and an explicit
+    # "turn on at HIGH" look identical (both speed=2), and the on_turn_on override then turned
+    # BOTH into LOW. That was the HA-card bug in #10: from OFF, pick HIGH -> the UI briefly shows
+    # HIGH -> the device transmits 0xbf + 0x1f -> the UI and the fan drop to LOW.
+    #
+    # Now, while OFF, the speed field holds fan_default_speed instead of 0 (set in on_turn_off
+    # and re-applied at boot). So a plain turn-on keeps that default, and an explicit speed
+    # replaces it. on_turn_on never overwrites the requested speed. It transmits power-on and
+    # then the actual target speed (the hardware's own power-on default is HIGH, so the speed
+    # is always sent explicitly). on_speed_set handles changes while already on.
+    # Side effect: HA's percentage attribute reads the default (e.g. 50%) while the fan is
+    # off instead of 0%. The on/off state itself is unaffected.
     on_turn_on:
       - if:
           condition:
@@ -591,13 +643,9 @@ fan:
             - script.execute:
                 id: send_command
                 command: 0xbf
-      # Default post-power-on speed is LOW (1), not HIGH (2) -- 0xbf ("power on") carries no
-      # speed selection of its own (see the status-beacon schema in
-      # docs/remote-capture-protocol.md: "On's status IS whatever Speed is currently held"),
-      # so this only needs to reflect a sane default for the local HA-reported state when
-      # turned on generically (not via an explicit speed_set). LOW matches the already-deployed
-      # device config and is the safer default (lower airflow/noise) until a real speed is set.
-      - lambda: !lambda 'id(house_fan).speed = 1;'
+            - script.execute:
+                id: send_speed
+                level: !lambda 'return id(house_fan).speed;'
     on_turn_off:
       - if:
           condition:
@@ -606,29 +654,19 @@ fan:
             - script.execute:
                 id: send_command
                 command: 0x80
-      - lambda: !lambda 'id(house_fan).speed = 0;'
+      - lambda: |-
+          id(commanded_speed) = 0;
+          id(house_fan).speed = ${fan_default_speed};
     on_speed_set:
+      # Only while on (a speed change while off, including on_turn_off's own reset to the
+      # default above, must never transmit), and only if on_turn_on didn't already send it.
       - if:
           condition:
-            lambda: !lambda 'return id(booted_up) && x == 0;'
+            lambda: 'return id(booted_up) && id(house_fan).state && x != id(commanded_speed);'
           then:
             - script.execute:
-                id: send_command
-                command: 0x80
-      - if:
-          condition:
-            lambda: !lambda 'return id(booted_up) && x == 1;'
-          then:
-            - script.execute:
-                id: send_command
-                command: 0x1f
-      - if:
-          condition:
-            lambda: !lambda 'return id(booted_up) && x == 2;'
-          then:
-            - script.execute:
-                id: send_command
-                command: 0x3f
+                id: send_speed
+                level: !lambda 'return x;'
 
 ####################################################################################################
 # Remote-receive support (Issue #1): exposes decoded remote button presses to Home Assistant.
