@@ -35,28 +35,32 @@ substitutions:
 ####################################################################################################
 # Boot guard (Issue #1): prevents this ESP from TRANSMITTING to the physical fan on boot.
 #
-# The `fan:` template platform restores its saved state during setup() and publishes it, which
-# runs its configured triggers -- which, in this component, include a REAL RF transmission via
-# send_command. Without a guard, a routine reboot (firmware update, power blip) would re-command
-# the physical fan with no user action at all. `booted_up` gates every transmit step (see the
-# fan: section below), so the boot-time replay only updates the entity's reported state.
-#
-# Restart state (phantom ON after a restart): the fan always comes up reported OFF
-# (restore_mode: ALWAYS_OFF). It no longer restores a saved ON. This ESP has no way to read the
-# physical fan's real state, and it deliberately doesn't transmit at boot, so a restored ON was
-# only a guess. Observed live: after a firmware update the entity restored ON at speed 2 while
-# the fan wasn't running. Why that saved record was stale is unproven; possible causes include
-# the physical remote turning the fan off (it doesn't update this entity), a power loss, or a
-# change not yet flushed to flash.
-# Tradeoff: if the fan really IS running when the ESP restarts, HA now shows it OFF. A turn-off
-# service call or automation (fan.turn_off) still stops it, because every turn-off transmits
-# even when the entity already reads OFF (see on_state in the fan: section). The HA card's
-# toggle on an OFF entity sends turn-on instead, so from the card it's turn on, then off.
+# The `fan:` template platform below has restore_mode: RESTORE_DEFAULT_OFF, which restores the
+# LAST KNOWN state on boot (defaulting to off only if nothing was ever persisted). Template
+# platforms have no independent way to reflect a restored state except by replaying their
+# configured action triggers (on_turn_on/on_speed_set) during setup() -- which, in this
+# component, includes a REAL RF transmission via send_command. Without a guard, a routine reboot
+# (firmware update, power blip) would silently re-command the physical fan to whatever HA last
+# recorded, with no user action at all. `booted_up` gates only the transmit step (see the fan:
+# section below) -- the entity's reported state still updates locally either way, so HA shows the
+# correct restored value; it just doesn't retransmit to force the physical fan to match.
 ####################################################################################################
 esphome:
   on_boot:
     priority: -100    # after other components have finished their own setup/restore
     then:
+      - lambda: |-
+          static_assert(${fan_default_speed} >= 1 && ${fan_default_speed} <= 2,
+                        "fan_default_speed must be 1 (LOW) or 2 (HIGH)");
+          // Issue #9/#10: while OFF, the fan entity's speed field holds fan_default_speed (see
+          // on_turn_off below). Re-apply it here, right after restore, so the next plain turn-on
+          // uses the configured default. This covers a fresh install, a device upgraded from an
+          // older version (which persisted speed=0 while off), and one whose fan_default_speed
+          // was just changed. Not published: nothing transmits. HA picks the value up on its next
+          // state sync (an already-connected HA may show 0% until then, which is cosmetic only).
+          if (!id(house_fan).state) {
+            id(house_fan).speed = ${fan_default_speed};
+          }
       - delay: 2s      # comfortably longer than template-entity restore/apply takes
       - lambda: 'id(booted_up) = true;'
 
@@ -611,11 +615,10 @@ fan:
     name: "quietcool whole house fan"
     id: house_fan
     speed_count: 2
-    # Always come up OFF after a restart -- see "Restart state" at the top of this file.
-    restore_mode: ALWAYS_OFF
+    restore_mode: RESTORE_DEFAULT_OFF
     # Every transmit below is gated on id(booted_up) (see the boot guard at the top of this file)
-    # so that the boot-time restore replay updates the entity's reported state without
-    # re-commanding the physical fan. Only genuine post-boot commands actually transmit.
+    # so that RESTORE_DEFAULT_OFF's boot-time state replay updates the entity's reported state
+    # without re-commanding the physical fan. Only genuine post-boot triggers actually transmit.
     #
     # Default speed vs. an explicitly chosen speed (Issues #9, #10). ESPHome's fan core
     # (FanCall::validate_) turns a plain "turn on" into "turn on at 100%" whenever the entity's
@@ -625,8 +628,8 @@ fan:
     # BOTH into LOW. That was the HA-card bug in #10: from OFF, pick HIGH -> the UI briefly shows
     # HIGH -> the device transmits 0xbf + 0x1f -> the UI and the fan drop to LOW.
     #
-    # Now, while OFF, the speed field holds fan_default_speed instead of 0 (set by the OFF branch
-    # of on_state, which also runs for the boot-time restore). So a plain turn-on keeps that default, and an explicit speed
+    # Now, while OFF, the speed field holds fan_default_speed instead of 0 (set in on_turn_off
+    # and re-applied at boot). So a plain turn-on keeps that default, and an explicit speed
     # replaces it. on_turn_on never overwrites the requested speed. It transmits power-on and
     # then the actual target speed (the hardware's own power-on default is HIGH, so the speed
     # is always sent explicitly). on_speed_set handles changes while already on.
@@ -643,40 +646,20 @@ fan:
             - script.execute:
                 id: send_speed
                 level: !lambda 'return id(house_fan).speed;'
-    # Turn-off is handled in on_state, not on_turn_off (restart-state fix). on_turn_off fires only on an
-    # ON -> OFF transition, so a turn-off sent while the entity already reads OFF (e.g. the fan
-    # was running when the ESP restarted, which always comes up OFF) would never transmit.
-    # on_state fires on every state publish. From HA and the web server, a publish that leaves
-    # the fan OFF is a turn-off command (their other calls always carry state=on) or the
-    # boot-time restore (where booted_up blocks the transmit). So "transmit 0x80 whenever a
-    # publish leaves it OFF" makes turn-off always transmit, still exactly once for a normal
-    # ON -> OFF. (A non-HA API client sending, say, a speed-only call while off would also send
-    # a harmless extra 0x80.)
-    on_state:
+    on_turn_off:
       - if:
           condition:
-            lambda: 'return !id(house_fan).state;'
+            lambda: 'return id(booted_up);'
           then:
-            - if:
-                condition:
-                  lambda: 'return id(booted_up);'
-                then:
-                  - script.execute:
-                      id: send_command
-                      command: 0x80
-            - lambda: |-
-                static_assert(${fan_default_speed} >= 1 && ${fan_default_speed} <= 2,
-                              "fan_default_speed must be 1 (LOW) or 2 (HIGH)");
-                // Issues #9/#10: while OFF, the speed field holds the default so a plain turn-on
-                // uses it (see above). This runs inside the current publish, so HA and the flash
-                // save see the default speed; nothing extra is transmitted. Running for the boot
-                // restore too means it also covers a fresh install, an upgrade from older
-                // firmware (which saved speed=0 while off), and a changed fan_default_speed.
-                id(commanded_speed) = 0;
-                id(house_fan).speed = ${fan_default_speed};
+            - script.execute:
+                id: send_command
+                command: 0x80
+      - lambda: |-
+          id(commanded_speed) = 0;
+          id(house_fan).speed = ${fan_default_speed};
     on_speed_set:
-      # Only while on (a speed change while off, including on_state's own reset to the default
-      # above, must never transmit), and only if on_turn_on didn't already send it.
+      # Only while on (a speed change while off, including on_turn_off's own reset to the
+      # default above, must never transmit), and only if on_turn_on didn't already send it.
       - if:
           condition:
             lambda: 'return id(booted_up) && id(house_fan).state && x != id(commanded_speed);'
