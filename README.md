@@ -26,7 +26,7 @@ Once you have your hardware all squared away, you'll need [ESPHome](https://esph
 
 ### Recommended: `packages:` + `substitutions:` (survives future updates)
 
-All of your per-device settings — remote ID, CC1101 wiring, radio frequency — live in one `substitutions:` block at the very top of [component.yaml](component.yaml). Rather than editing that file directly, add a `packages:` entry to your own dashboard file that pulls it in, and override just the values you need:
+All of your per-device settings — remote ID, CC1101 wiring, radio frequency, default "on" speed — live in one `substitutions:` block at the very top of [component.yaml](component.yaml). Rather than editing that file directly, add a `packages:` entry to your own dashboard file that pulls it in, and override just the values you need:
 
 ```yaml
 substitutions:
@@ -34,6 +34,7 @@ substitutions:
   remote_id_1: "0x00"
   remote_id_2: "0xcc"   # your remote's actual ID -- see below for how to read it
   remote_id_3: "0x27"
+  fan_default_speed: "2"   # speed for a plain "turn on" with no speed chosen: 1 = LOW (default), 2 = HIGH
   # Only list the ones that differ from component.yaml's own defaults --
   # cc1101_clk_pin, cc1101_frequency, etc. are all overridable the same way.
 
