@@ -49,19 +49,20 @@ esphome:
   on_boot:
     priority: -100    # after other components have finished their own setup/restore
     then:
-      - delay: 2s      # comfortably longer than template-entity restore/apply takes
       - lambda: |-
           static_assert(${fan_default_speed} >= 1 && ${fan_default_speed} <= 2,
                         "fan_default_speed must be 1 (LOW) or 2 (HIGH)");
           // Issue #9/#10: while OFF, the fan entity's speed field holds fan_default_speed (see
-          // on_turn_off below). Re-apply it here, after restore, so a device upgraded from an
-          // older version (which persisted speed=0 while off) or one whose fan_default_speed was
-          // just changed picks up the configured default on the next plain turn-on. Not published:
-          // nothing transmits, and HA reads the current value when it next syncs the entity.
+          // on_turn_off below). Re-apply it here, right after restore, so the next plain turn-on
+          // uses the configured default. This covers a fresh install, a device upgraded from an
+          // older version (which persisted speed=0 while off), and one whose fan_default_speed
+          // was just changed. Not published: nothing transmits. HA picks the value up on its next
+          // state sync (an already-connected HA may show 0% until then, which is cosmetic only).
           if (!id(house_fan).state) {
             id(house_fan).speed = ${fan_default_speed};
           }
-          id(booted_up) = true;
+      - delay: 2s      # comfortably longer than template-entity restore/apply takes
+      - lambda: 'id(booted_up) = true;'
 
 globals:
   - id: booted_up
