@@ -168,6 +168,17 @@ so Home Assistant correctly shows the restored value — it just doesn't retrans
 physical fan to match on every boot. A genuine post-boot command (from HA or a config change)
 transmits normally once `booted_up` is `true`.
 
+**Follow-up: phantom ON after a restart (fixed).** Restoring the last known state without
+retransmitting assumed the saved state still matched the physical fan. It doesn't always. This
+ESP can't read the fan's real state, so a saved ON goes stale whenever the fan stops some other
+way (e.g. the physical remote, a power loss, or a change not yet flushed to flash). Observed
+live: after a firmware update, HA showed the fan ON (the log's later turn-off reported
+`Speed: 2`) while it wasn't running, and nobody or nothing had turned it on. Fix: `restore_mode:
+ALWAYS_OFF`, so the fan always comes up reported OFF. Turn-off moved from `on_turn_off` (fires
+only on an ON -> OFF edge) to `on_state` (fires on every publish), so a turn-off from HA always
+transmits `0x80`, even when the entity already reads OFF. If the fan really is running when the
+ESP restarts, HA can still turn it off.
+
 ### ID-level corruption rejecting an otherwise-good command byte (fixed)
 
 **Symptom:** setting Low from High sometimes did not fire the `low` event at all.
