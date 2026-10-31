@@ -35,8 +35,8 @@ substitutions:
 ####################################################################################################
 # Boot guard (Issue #1): prevents this ESP from TRANSMITTING to the physical fan on boot.
 #
-# The `fan:` template platform restores its saved state during setup() by replaying its
-# configured triggers -- which, in this component, include a REAL RF transmission via
+# The `fan:` template platform restores its saved state during setup() and publishes it, which
+# runs its configured triggers -- which, in this component, include a REAL RF transmission via
 # send_command. Without a guard, a routine reboot (firmware update, power blip) would re-command
 # the physical fan with no user action at all. `booted_up` gates every transmit step (see the
 # fan: section below), so the boot-time replay only updates the entity's reported state.
@@ -44,12 +44,14 @@ substitutions:
 # Restart state (phantom ON after a restart): the fan always comes up reported OFF
 # (restore_mode: ALWAYS_OFF). It no longer restores a saved ON. This ESP has no way to read the
 # physical fan's real state, and it deliberately doesn't transmit at boot, so a restored ON was
-# only a guess. It went
-# wrong whenever the saved record was stale (e.g. the physical remote turned the fan off, the
-# fan lost power, or a recent change wasn't flushed to flash yet). HA then showed the fan ON
-# while it wasn't running. If the fan really IS running when the ESP restarts, turning it off
-# from HA still works: every turn-off transmits, even when the entity already reads OFF (see
-# on_state in the fan: section).
+# only a guess. Observed live: after a firmware update the entity restored ON at speed 2 while
+# the fan wasn't running. Why that saved record was stale is unproven; possible causes include
+# the physical remote turning the fan off (it doesn't update this entity), a power loss, or a
+# change not yet flushed to flash.
+# Tradeoff: if the fan really IS running when the ESP restarts, HA now shows it OFF. A turn-off
+# service call or automation (fan.turn_off) still stops it, because every turn-off transmits
+# even when the entity already reads OFF (see on_state in the fan: section). The HA card's
+# toggle on an OFF entity sends turn-on instead, so from the card it's turn on, then off.
 ####################################################################################################
 esphome:
   on_boot:
@@ -644,10 +646,12 @@ fan:
     # Turn-off is handled in on_state, not on_turn_off (restart-state fix). on_turn_off fires only on an
     # ON -> OFF transition, so a turn-off sent while the entity already reads OFF (e.g. the fan
     # was running when the ESP restarted, which always comes up OFF) would never transmit.
-    # on_state fires on every state publish. Every publish that leaves the fan OFF is either a
-    # turn-off command or the boot-time restore (where booted_up blocks the transmit). So
-    # "transmit 0x80 whenever a publish leaves it OFF" makes turn-off always transmit, and it
-    # still transmits exactly once for a normal ON -> OFF.
+    # on_state fires on every state publish. From HA and the web server, a publish that leaves
+    # the fan OFF is a turn-off command (their other calls always carry state=on) or the
+    # boot-time restore (where booted_up blocks the transmit). So "transmit 0x80 whenever a
+    # publish leaves it OFF" makes turn-off always transmit, still exactly once for a normal
+    # ON -> OFF. (A non-HA API client sending, say, a speed-only call while off would also send
+    # a harmless extra 0x80.)
     on_state:
       - if:
           condition:
@@ -664,7 +668,8 @@ fan:
                 static_assert(${fan_default_speed} >= 1 && ${fan_default_speed} <= 2,
                               "fan_default_speed must be 1 (LOW) or 2 (HIGH)");
                 // Issues #9/#10: while OFF, the speed field holds the default so a plain turn-on
-                // uses it (see above). Not published: nothing transmits. Running for the boot
+                // uses it (see above). This runs inside the current publish, so HA and the flash
+                // save see the default speed; nothing extra is transmitted. Running for the boot
                 // restore too means it also covers a fresh install, an upgrade from older
                 // firmware (which saved speed=0 while off), and a changed fan_default_speed.
                 id(commanded_speed) = 0;
