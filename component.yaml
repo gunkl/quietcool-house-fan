@@ -31,6 +31,18 @@ substitutions:
   # "2" = HIGH. Choosing a speed explicitly (e.g. picking HIGH in the HA fan card) always wins
   # over this default. "1" (LOW) preserves this component's behavior from before this setting.
   fan_default_speed: "1"
+  # Tuning for the OPTIONAL power-entity package (power-entity.yaml, see README); harmless defaults
+  # otherwise. The power reading lags a real change. Measured (gunkl/ClimateAdvisor#1215 production
+  # logs): ON up to 14.0 s after a remote timer press (9.4 s on another; an earlier ~5.5 s figure was
+  # a still-spinning fan restarting, not a cold start), OFF ~15.5 s. Defaults add margin to the worst
+  # case: 20 s (14.0 + ~40%) for on, 25 s for off. Inside this window after a remote press or a
+  # transmission from this device the entity follows that event and the reading may not override it.
+  power_on_lag_s: "20"
+  power_off_lag_s: "25"
+  # Hard timeout: after the lag window the reading only overrides the entity once it has CHANGED since
+  # the event (so a slow spin-up, still reading "off", never flips an entity the user just turned
+  # on). If it has not changed at all by this long after the event, it wins anyway.
+  power_hard_timeout_s: "90"
 
 ####################################################################################################
 # Boot guard (Issue #1): prevents this ESP from TRANSMITTING to the physical fan on boot.
@@ -63,6 +75,7 @@ esphome:
           }
       - delay: 2s      # comfortably longer than template-entity restore/apply takes
       - lambda: 'id(booted_up) = true;'
+      - script.execute: reconcile_loop
 
 globals:
   - id: booted_up
@@ -107,6 +120,132 @@ globals:
     initial_value: '0'
   - id: last_sent_command_ms
     type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  # True only while sync_fan_from_remote (script section below) is publishing a REMOTE-observed
+  # power/speed change onto house_fan. The fan's on_turn_on/on_turn_off/on_speed_set triggers fire
+  # from ESPHome's state callback and cannot be bypassed, so every RF transmit in them is gated on
+  # this being false -- otherwise mirroring the remote would transmit it straight back (gunkl/ClimateAdvisor#1215).
+  - id: syncing_from_remote
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # -- "Any byte that implies ON" support (gunkl/ClimateAdvisor#1215) -------------------------------------------
+  # The remote has no dedicated power-on press: 0xBF is just "timer=none, speed=high", and a
+  # power-up "does not reliably re-transmit" anything (docs/remote-capture-protocol.md, "Interpretation
+  # rule for consumers"). So house_fan mirrors "on" from ANY confirmed speed/timer/0xBF byte, and
+  # "off" only from a confirmed 0x80/0xB0. The globals below keep a post-off status beacon from
+  # flipping the entity back on: an UNCHANGED (already-held) byte only counts as a power-on when it
+  # belongs to a fresh interaction (see remote_hint in the script section).
+  #   last_remote_rx_ms  when we last heard ANY packet from our remote (0 = never)
+  #   fresh_ms           when the current fresh interaction began (a 0x66 wake, or the first packet
+  #                      after a quiet gap); 0 = none. Cleared by a confirmed off.
+  #   implied_on_*       2-reading confirmation for an unchanged-but-fresh implied-on byte
+  - id: last_remote_rx_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: fresh_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: implied_on_count
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: implied_on_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: implied_off_count
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: implied_off_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  # -- Two separate states (gunkl/ClimateAdvisor#1215) -------------------------------------------------------------
+  # (a) What the REMOTE last announced, per field: power_state / speed_state / timer_state above.
+  #     They change ONLY when remote packets confirm a new value; this device's own transmissions
+  #     never touch them. The physical remote never hears us, so after CA starts the fan the remote
+  #     still believes whatever it last said -- overwriting these with CA's commands made the remote's
+  #     next plain wake (re-sending that stale value) look like a brand-new press.
+  # (b) The fan's actual state: the house_fan entity.
+  # A remote message changes (b) only when it changes (a), i.e. a real press. remote_power is (a)'s
+  # power view including what speed/timer bytes imply (0 unknown, 1 on, 2 off); it exists because
+  # power_state alone must stay exactly as it was for the HA events.
+  # Persisted across reboots: after an ESP restart the remote still holds whatever it last said, so
+  # its next plain wake must not look like a press (a stale status re-sent after a reboot, e.g. a
+  # stale "on" speed after CA stopped the fan). The held per-field values above are NOT persisted
+  # (they feed the HA events exactly as before); for the ENTITY only, the first confirmation of a
+  # field after boot (previous value 0) is treated as "unchanged" -- see remote_hint.
+  - id: remote_power
+    type: uint8_t
+    restore_value: true
+    initial_value: '0'
+  # Set true at runtime by the optional power-entity package (power-entity.yaml).
+  # True = a power reading is the source of truth, so the timer countdown fallback is not used.
+  - id: power_entity_present
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # The latest remote press or local transmission that moved the entity, and which way. Inside the
+  # power_*_lag_s window after it, the entity follows it and the power reading cannot override it.
+  - id: last_event_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: last_event_on
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # Power reading imported from HA (power-entity.yaml): 0 = none/unavailable/unknown, 1 = on, 2 = off,
+  # plus when it last changed (a change must hold ~2 s before it is trusted).
+  - id: power_reading
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: power_reading_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  # Last REAL (on/off) reading, kept across "unavailable" so power_reading_ms only moves on a true change.
+  - id: power_reading_last
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+
+  # Timer countdown fallback (only with NO power-entity package): a remote timer that runs out transmits
+  # nothing, so without a power reading the entity would read "on" forever.
+  - id: timer_armed
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: timer_deadline_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  # Every byte this device transmitted in the last few seconds (ring buffer, newest overwrites
+  # oldest). A received packet equal to ANY of them within SELF_ECHO_WINDOW_MS is our own echo and is
+  # dropped before decode. Our sends are multi-byte (0xBF then a speed byte), so remembering only the
+  # last byte let echoes of the earlier ones through and change the remote's held state (a).
+  - id: sent_cmds
+    type: 'uint8_t[8]'
+    restore_value: false
+    initial_value: '{0, 0, 0, 0, 0, 0, 0, 0}'
+  - id: sent_cmds_ms
+    type: 'uint32_t[8]'
+    restore_value: false
+    initial_value: '{0, 0, 0, 0, 0, 0, 0, 0}'
+  - id: sent_cmds_idx
+    type: uint8_t
     restore_value: false
     initial_value: '0'
 
@@ -259,9 +398,10 @@ cc1101:
           // same-field reading is trusted as a genuinely new candidate and does overwrite. See
           // docs/remote-capture-protocol.md for the capture evidence behind these rules.
 
-          static const uint32_t SELF_ECHO_WINDOW_MS = 500;        // tune after running the capture protocol
+          static const uint32_t SELF_ECHO_WINDOW_MS = 2000;       // any byte we sent (sent_cmds ring), not just the last
           static const uint32_t SAME_BURST_TOLERANCE_MS = 400;    // covers the ~70-260ms intra-burst spacing, with margin
           static const uint32_t CONFIRM_WINDOW_MS = 1500;         // overall candidate lifetime before it's abandoned
+          static const uint32_t NEW_BURST_GAP_MS = 3000;          // silence this long => next packet starts a new interaction
           static const uint8_t ID_FUZZY_MATCH_BITS = 2;           // tolerate this many differing bits across the 4 ID bytes
 
           uint32_t now_ms = millis();
@@ -330,11 +470,25 @@ cc1101:
           // (send_command below stamps last_sent_command/_ms right before sending). This is
           // UNRELATED to the field/heartbeat model above -- it only protects against hearing
           // our own just-sent command, never against the remote's own repeats.
-          uint32_t since_last_tx_ms = now_ms - id(last_sent_command_ms);
-          if (id(last_sent_command_ms) != 0 && cmd == id(last_sent_command) && since_last_tx_ms < SELF_ECHO_WINDOW_MS) {
-            ESP_LOGD("quietcool-fan", "Suppressed as self-echo (cmd 0x%02x sent %u ms ago)", cmd, since_last_tx_ms);
-            return;
+          // Checks EVERY byte in the sent_cmds ring (a send is several bytes, e.g. 0xBF then a speed
+          // byte): production showed a `low` event ~1 s after CA's 0xBF+0x1F -- an echo of the
+          // earlier byte passed the old last-byte-only, 500 ms guard and changed speed_state
+          // (gunkl/ClimateAdvisor#1215). Dropped here, so such self-echoes no longer fire HA events.
+          for (uint8_t i = 0; i < 8; i++) {
+            uint32_t sent_age_ms = now_ms - id(sent_cmds_ms)[i];
+            if (id(sent_cmds_ms)[i] != 0 && cmd == id(sent_cmds)[i] && sent_age_ms < SELF_ECHO_WINDOW_MS) {
+              ESP_LOGD("quietcool-fan", "Suppressed as self-echo (cmd 0x%02x sent %u ms ago)", cmd, (unsigned) sent_age_ms);
+              return;
+            }
           }
+
+          // Fresh-interaction tracking (gunkl/ClimateAdvisor#1215). A 0x66 wake, or the first packet after a quiet
+          // gap, marks the start of a new interaction; remote_hint uses it to tell a
+          // genuine new press from the remote's post-off status beacon repeating old values.
+          if (cmd == 0x66 || id(last_remote_rx_ms) == 0 || (now_ms - id(last_remote_rx_ms)) > NEW_BURST_GAP_MS) {
+            id(fresh_ms) = now_ms;
+          }
+          id(last_remote_rx_ms) = now_ms;
 
           // ---- POWER field ------------------------------------------------------------------
           // 0x80 (fired once, as the action, right when Off is pressed) and 0xB0 (the ongoing
@@ -346,6 +500,9 @@ cc1101:
           if (cmd == 0xbf || cmd == 0x80 || cmd == 0xb0) {
             uint8_t normalized = (cmd == 0xbf) ? 0xbf : 0x80;
             if (normalized == id(power_state)) {
+              // Unchanged vs what the remote already announced: not a press by itself (a plain wake
+              // just repeats it). remote_hint decides whether it is a fresh re-press (gunkl/ClimateAdvisor#1215).
+              id(remote_hint)->execute(normalized == 0xbf, normalized == 0xbf ? 2 : 0, false, cmd, -1);
               return;  // heartbeat re-confirming already-accepted state
             }
             uint32_t power_age_ms = now_ms - id(pending_power_ms);
@@ -354,6 +511,7 @@ cc1101:
               // Matches the in-progress candidate -- confirm.
               id(pending_power_count) += 1;
               if (id(pending_power_count) >= 2) {
+                uint8_t prev_power = id(power_state);   // for remote_hint only; 0 = first confirmation since boot
                 id(power_state) = normalized;
                 std::string token = (normalized == 0xbf) ? "on" : "off";
                 ESP_LOGI("quietcool-fan", "Power: CONFIRMED 0x%02x -> firing event '%s'", normalized, token.c_str());
@@ -393,6 +551,30 @@ cc1101:
                   // explicitly rather than overstating confidence.
                   id(speed_state) = 0x3f;
                 }
+                // ==== Fan entity follows the remote's power (gunkl/ClimateAdvisor#1215, gunkl/ClimateAdvisor#449) ====================
+                // A remote press never touched house_fan's state, so after a remote start HA's
+                // entity still read "off" and a plain fan.turn_off was a no-op: ESPHome fires
+                // on_turn_off (the only place 0x80 is transmitted) solely on an on->off edge. CA
+                // worked around it with "on, wait, off" (gunkl/ClimateAdvisor#449), which looped against a lagging
+                // power reading (gunkl/ClimateAdvisor#1215). Now a CONFIRMED remote power change (we are past the
+                // 2-reading debounce here) is mirrored onto the entity -- no transmit -- so the
+                // next HA turn_off/turn_on is a real edge. A remote start reads as HIGH (see above).
+                // "Off" is only ever mirrored from here (0x80/0xB0). "On" is ALSO mirrored from any
+                // confirmed speed/timer byte -- see remote_hint -- because 0xBF is not a
+                // dedicated power-on press and often never arrives (e.g. off, then timer_1h).
+                // The first confirmation after boot (prev_power == 0) is treated as unchanged for the
+                // entity: a stale status re-sent after a reboot must not look like a press.
+                id(timer_armed) = false;   // a power change supersedes any timer countdown
+                if (normalized == 0xbf) {
+                  id(remote_hint)->execute(true, 2, prev_power != 0, cmd, prev_power == 0 ? 0 : -1);
+                } else {
+                  id(remote_hint)->execute(false, 0, prev_power != 0, cmd, -1);
+                  id(implied_off_count) = 0;
+                  // The off burst and the status beacon trailing it must not look like a new
+                  // interaction to remote_hint.
+                  id(fresh_ms) = 0;
+                  id(implied_on_count) = 0;
+                }
                 id(pending_power_count) = 0;
               }
             } else if (id(pending_power_count) > 0 && power_age_ms <= SAME_BURST_TOLERANCE_MS) {
@@ -412,6 +594,7 @@ cc1101:
           // ---- SPEED field ------------------------------------------------------------------
           if (cmd == 0x1f || cmd == 0x2f || cmd == 0x3f) {
             if (cmd == id(speed_state)) {
+              id(remote_hint)->execute(true, (cmd == 0x1f) ? 1 : 2, false, cmd, -1);
               return;  // heartbeat re-confirming already-accepted state
             }
             uint32_t speed_age_ms = now_ms - id(pending_speed_ms);
@@ -420,6 +603,7 @@ cc1101:
               // Matches the in-progress candidate -- confirm.
               id(pending_speed_count) += 1;
               if (id(pending_speed_count) >= 2) {
+                uint8_t prev_speed = id(speed_state);   // 0 = first confirmation since boot
                 id(speed_state) = cmd;
                 std::string token = (cmd == 0x1f) ? "low" : (cmd == 0x2f) ? "medium" : "high";
                 ESP_LOGI("quietcool-fan", "Speed: CONFIRMED 0x%02x -> firing event '%s'", cmd, token.c_str());
@@ -429,6 +613,9 @@ cc1101:
                 // is already exactly "low"/"medium"/"high".
                 id(quietcool_speed_sensor).publish_state(token);
                 ESP_LOGD("quietcool-fan", "Speed sensor updated from speed branch: %s", token.c_str());
+                // A confirmed speed byte means the fan is on (gunkl/ClimateAdvisor#1215): turns the entity on if it
+                // reads off, else just keeps its speed in step.
+                id(remote_hint)->execute(true, (cmd == 0x1f) ? 1 : 2, prev_speed != 0, cmd, -1);
                 id(pending_speed_count) = 0;
               }
             } else if (id(pending_speed_count) > 0 && speed_age_ms <= SAME_BURST_TOLERANCE_MS) {
@@ -483,6 +670,10 @@ cc1101:
             uint8_t implied_speed_byte = (timer_family == 0x90) ? 0x1f : 0x2f;  // 0xB0 never reaches here -- see POWER branch above
             bool speed_is_stale = is_no_timer && (implied_speed_byte != id(speed_state));
             if (cmd == id(timer_state) && !speed_is_stale) {
+              // An unchanged timer byte heard in a fresh interaction is a re-press of the same
+              // timer: remote_hint re-arms the countdown (0 = "no timer" re-press cancels it).
+              id(remote_hint)->execute(true, (timer_family == 0x90) ? 1 : 2, false, cmd,
+                                       is_no_timer ? 0 : ((timer_value == 0xC) ? 12 : (int) timer_value));
               return;  // true heartbeat -- neither duration nor speed context has anything new
             }
             uint32_t timer_age_ms = now_ms - id(pending_timer_ms);
@@ -491,6 +682,7 @@ cc1101:
               // Matches the in-progress candidate -- confirm.
               id(pending_timer_count) += 1;
               if (id(pending_timer_count) >= 2) {
+                uint8_t prev_timer = id(timer_state);   // 0 = first confirmation since boot
                 id(timer_state) = cmd;
                 // Ambient speed sensor (Issue: Climate Advisor speed-aware remote) -- every
                 // CONFIRMED timer-family byte also carries the current speed context in its
@@ -501,7 +693,31 @@ cc1101:
                 const char *speed_ctx = (timer_family == 0x90) ? "low" : (timer_family == 0xA0) ? "medium" : "high";
                 id(quietcool_speed_sensor).publish_state(speed_ctx);
                 ESP_LOGD("quietcool-fan", "Speed sensor updated from timer branch: %s", speed_ctx);
+                // Any confirmed timer-family byte (0x9_/0xA_/0xB_, incl. no-timer 0x9F) means the
+                // fan is on, at this speed context (gunkl/ClimateAdvisor#1215). 0xA_ (medium) is speculative; it
+                // maps to HIGH since this fan only has 2 speeds.
+                int timer_hours = is_no_timer ? 0 : ((timer_value == 0xC) ? 12 : (int) timer_value);
+                // Captured BEFORE remote_hint moves the entity: a timer started after an off (or on a
+                // fan the entity reads off) is a new start even if the duration equals the held one.
+                bool was_off = !id(house_fan).state || id(remote_power) == 2;
+                id(remote_hint)->execute(true, (timer_family == 0x90) ? 1 : 2, prev_timer != 0, cmd,
+                                         prev_timer == 0 ? timer_hours : -1);
                 std::string token;
+                // Timer countdown fallback (gunkl/ClimateAdvisor#1215), only without the power-entity
+                // package: a remote timer that expires transmits nothing, so remember when this one
+                // should end and mirror "off" then (reconcile_loop). It follows the TIMER field:
+                // a new duration arms/re-arms it, "no timer" cancels it, a speed-family-only change
+                // (same duration, e.g. 0x91 -> 0xB1) and speed-field presses leave it alone, and an
+                // unchanged fresh re-press re-arms it via remote_hint. The first confirmation after
+                // boot (prev_timer == 0) is left to remote_hint, so a stale wake cannot arm it.
+                if (!id(power_entity_present) && prev_timer != 0) {
+                  if (is_no_timer) {
+                    id(timer_armed) = false;
+                  } else if ((prev_timer & 0x0F) != timer_value || was_off) {
+                    id(timer_deadline_ms) = now_ms + (uint32_t) timer_hours * 3600000UL;
+                    id(timer_armed) = true;
+                  }
+                }
                 if (timer_value == 0x1) token = "timer_1h";
                 else if (timer_value == 0x2) token = "timer_2h";
                 else if (timer_value == 0x4) token = "timer_4h";
@@ -570,6 +786,12 @@ script:
           // Stamp what we're about to send (Issue #1 self-echo guard, see on_packet above).
           id(last_sent_command) = (uint8_t) command;
           id(last_sent_command_ms) = millis();
+          {
+            uint8_t ring_i = id(sent_cmds_idx);
+            id(sent_cmds)[ring_i] = (uint8_t) command;
+            id(sent_cmds_ms)[ring_i] = id(last_sent_command_ms);
+            id(sent_cmds_idx) = (ring_i + 1) % 8;
+          }
       - cc1101.send_packet:
           data: !lambda |-
             std::vector<uint8_t> packet(id(remote_id), id(remote_id)+4);
@@ -598,6 +820,239 @@ script:
             - id(remote_id)[1]
             - id(remote_id)[2]
             - id(remote_id)[3]
+
+  # Mirror a change onto the house_fan entity WITHOUT transmitting (gunkl/ClimateAdvisor#1215).
+  #   power: 1 = on, 0 = off, -1 = leave on/off alone
+  #   level: 1/2 = speed to adopt (only applied while the fan is on), 0 = leave speed alone
+  #   record: true = this is a press-driven change, so start the power-reading lag window
+  # Only on/off and the 2 real speeds are mirrored; timers are not. There is no ESPHome API that
+  # updates a template fan's state silently: publish_state() runs the state callbacks, which is
+  # what fires on_turn_on/on_turn_off/on_speed_set. So syncing_from_remote is raised for the
+  # duration (the callbacks run synchronously inside publish_state) and the transmit steps in the
+  # fan: section below are gated on it. The non-transmit housekeeping in on_turn_off (reset
+  # speed to fan_default_speed) still runs, which is what we want after a remote off.
+  - id: sync_fan_from_remote
+    mode: single
+    parameters:
+      power: int
+      level: int
+      record: bool
+    then:
+      - lambda: |-
+          bool changed = false;
+          bool state_changed = false;
+          if (power >= 0 && id(house_fan).state != (power == 1)) {
+            id(house_fan).state = (power == 1);
+            changed = true;
+            state_changed = true;
+          }
+          if (level > 0 && id(house_fan).state && id(house_fan).speed != level) {
+            id(house_fan).speed = level;
+            changed = true;
+          }
+          if (!changed) return;
+          if (state_changed && record) {
+            id(last_event_ms) = millis();
+            id(last_event_on) = id(house_fan).state;
+          }
+          ESP_LOGI("quietcool-fan", "Fan entity follows %s: state=%s speed=%d (no transmit)",
+                   record ? "remote" : "power reading/timer", id(house_fan).state ? "on" : "off",
+                   id(house_fan).speed);
+          id(syncing_from_remote) = true;
+          id(house_fan).publish_state();
+          id(syncing_from_remote) = false;
+          // The speed the fan now runs at counts as "sent": otherwise a later HA speed change back
+          // to the value we last TRANSMITTED (before the remote moved it) would be swallowed by
+          // on_speed_set's x != commanded_speed check. (on_turn_off already resets it to 0.)
+          if (id(house_fan).state) id(commanded_speed) = id(house_fan).speed;
+
+  # What a confirmed (or re-heard) remote byte means for the ENTITY (gunkl/ClimateAdvisor#1215).
+  #   wants_on: the byte says or implies the fan is on (0xBF, a speed byte, any timer-family byte);
+  #             false = the off bytes 0x80/0xB0.
+  #   changed:  it reached its field's CONFIRM block with a previous held value (a real press);
+  #             false = an already-held value heard again, OR the first confirmation of that field
+  #             since boot (a stale status re-sent after a reboot).
+  #   raw:      the received command byte (0x80 and 0xB0 are not interchangeable here).
+  #   hours:    timer countdown instruction for an unchanged re-press: -1 none, 0 cancel, >0 re-arm.
+  #
+  # Nothing here touches the HA events or power_state/speed_state/timer_state (state (a)). It only
+  # decides whether state (b), the entity, moves. Rules (cases: docs/remote-capture-protocol.md,
+  # "Fan entity state follows the remote"):
+  #  - CHANGED on-byte: the remote moved, so the entity goes on (or its speed follows if already on);
+  #  - UNCHANGED on-byte: first it must be a fresh interaction (0x66 wake, or first packet after >3 s
+  #    silence) heard twice. Then the entity moves only if it is off AND the remote had announced OFF
+  #    (remote_power == 2); if the remote still holds "on" (CA stopped the fan behind its back) it is
+  #    indistinguishable from a plain wake re-sending stale status, so it changes nothing. The same
+  #    accepted re-press re-arms the timer countdown;
+  #  - CHANGED off-byte: the entity goes off;
+  #  - UNCHANGED off-byte: 0xB0 (the status beacon a wake re-sends) NEVER moves the entity. 0x80 (the
+  #    action byte, sent only when Off is pressed) heard twice while the entity is on counts as an
+  #    off press whatever remote_power says -- this is also how "CA on, remote held off, remote off
+  #    pressed" is seen.
+  # Our own transmissions are dropped before decode (sent_cmds ring), so no extra after-transmit
+  # blackout is needed for learning from the remote; only the unchanged-0x80 path keeps a short one.
+  - id: remote_hint
+    mode: single
+    parameters:
+      wants_on: bool
+      level: int
+      changed: bool
+      raw: int
+      hours: int
+    then:
+      - lambda: |-
+          static const uint32_t FRESH_WINDOW_MS = 2500;
+          static const uint32_t CONFIRM_WINDOW_MS = 1500;
+          static const uint32_t OWN_TX_QUIET_MS = 500;
+          uint32_t now_ms = millis();
+          if (wants_on) {
+            if (!changed) {
+              if (id(fresh_ms) == 0 || (now_ms - id(fresh_ms)) > FRESH_WINDOW_MS) return;
+              if (id(implied_on_count) > 0 && (now_ms - id(implied_on_ms)) <= CONFIRM_WINDOW_MS) {
+                id(implied_on_count) += 1;
+              } else {
+                id(implied_on_count) = 1;
+                id(implied_on_ms) = now_ms;
+              }
+              if (id(implied_on_count) < 2) return;
+              id(implied_on_count) = 0;
+              // Only a remote that ANNOUNCED off (remote_power == 2) can have been re-pressed: 0 (never
+              // seen, e.g. the first boot after flashing) and 1 (still holds "on") both look exactly
+              // like a plain wake re-sending stale status.
+              bool turns_on = !id(house_fan).state && id(remote_power) == 2;
+              // An accepted fresh re-press of a timer re-arms the countdown (and "no timer" cancels
+              // it) -- but a re-arm needs a countdown already running or this very call turning the
+              // fan on; otherwise a stale wake re-sending e.g. 0x91 after the timer expired and CA
+              // restarted the fan would arm a countdown that switches the entity off an hour later.
+              if (!id(power_entity_present) && hours >= 0) {
+                if (hours == 0) {
+                  id(timer_armed) = false;
+                } else if (id(timer_armed) || turns_on) {
+                  id(timer_deadline_ms) = now_ms + (uint32_t) hours * 3600000UL;
+                  id(timer_armed) = true;
+                }
+              }
+              if (!turns_on) return;
+              ESP_LOGI("quietcool-fan", "Remote re-press after an announced off implies power ON (level=%d)", level);
+            }
+            id(remote_power) = 1;
+            id(implied_off_count) = 0;
+            if (id(house_fan).state) {
+              if (changed) id(sync_fan_from_remote)->execute(-1, level, false);
+            } else {
+              id(sync_fan_from_remote)->execute(1, level, true);
+            }
+          } else {
+            if (!changed) {
+              // 0xB0 (the status beacon a plain wake re-sends) never moves the entity ON ITS OWN. 0x80
+              // (the action byte, sent only when Off is pressed) needs two readings -- but its first
+              // copy is often corrupted, so one 0x80 followed by a 0xB0 within the same-burst
+              // tolerance also counts (an off press is announced as 0x80 then the 0xB0 status).
+              static const uint32_t SAME_BURST_TOLERANCE_MS = 400;
+              if (raw != 0x80 && raw != 0xB0) return;
+              if (!id(house_fan).state) return;
+              if (id(last_sent_command_ms) != 0 && (now_ms - id(last_sent_command_ms)) < OWN_TX_QUIET_MS) return;
+              if (raw == 0xB0) {
+                if (!(id(implied_off_count) == 1 && (now_ms - id(implied_off_ms)) <= SAME_BURST_TOLERANCE_MS)) return;
+                id(implied_off_count) = 2;
+              } else if (id(implied_off_count) > 0 && (now_ms - id(implied_off_ms)) <= CONFIRM_WINDOW_MS) {
+                id(implied_off_count) += 1;
+              } else {
+                id(implied_off_count) = 1;
+                id(implied_off_ms) = now_ms;
+              }
+              if (id(implied_off_count) < 2) return;
+              ESP_LOGI("quietcool-fan", "Remote off action (0x80) confirmed again while the entity is on");
+            }
+            id(implied_off_count) = 0;
+            id(implied_on_count) = 0;
+            id(remote_power) = 2;
+            id(timer_armed) = false;
+            id(sync_fan_from_remote)->execute(0, 0, true);
+          }
+
+  # Called by the optional power-entity package (power-entity.yaml).
+  - id: power_reading_update
+    mode: single
+    parameters:
+      state: std::string
+    then:
+      - lambda: |-
+          uint8_t v = (state == "on") ? 1 : (state == "off") ? 2 : 0;   // unavailable/unknown -> ignored
+          if (v == 0) {
+            // Unavailable/unknown: stop trusting the reading, but remember the last real value so a
+            // return to the SAME value is not mistaken for a change (it would win the spin-up hold).
+            if (id(power_reading) != 0) ESP_LOGI("quietcool-fan", "Power reading unavailable (%s) -- ignored", state.c_str());
+            id(power_reading) = 0;
+          } else {
+            if (v != id(power_reading_last)) {
+              id(power_reading_ms) = millis();
+              id(power_reading_last) = v;
+              ESP_LOGI("quietcool-fan", "Power reading: %s", state.c_str());
+            }
+            id(power_reading) = v;
+          }
+
+  # Once per second, started from on_boot (a looping script rather than an interval: block, so the
+  # paste-in install does not gain a top-level key that may collide with your own).
+  #  - WITH the power-entity package: reconcile the entity with the power reading (see below).
+  #  - WITHOUT it: mirror "off" when a remote timer's countdown has elapsed.
+  # Reading-vs-entity rule (it lags a real change by up to ~14 s on / ~15.5 s off):
+  #  - disagreement inside the lag window after the last remote press / our own transmission: the
+  #    event wins, the reading is ignored;
+  #  - after the window the reading wins. After an ON event it must also have CHANGED since that
+  #    event (a slow spin-up still reading "off" must never flip an entity the user just turned on),
+  #    or power_hard_timeout_s must have passed. After an OFF event it wins as soon as the window is
+  #    over (a lost RF off must not leave the entity stuck "off" and swallow CA's retries);
+  #  - with no event at all (timer ran out, wall switch, power cut, boot) the reading wins once it
+  #    has held ~2 s;
+  #  - "unavailable"/"unknown" readings are ignored (power_reading 0), and nothing is reconciled while
+  #    the API is disconnected: the text sensor does not clear itself on disconnect, so its last value
+  #    would otherwise be trusted indefinitely.
+  - id: reconcile_loop
+    mode: single
+    then:
+      - while:
+          condition:
+            lambda: 'return true;'
+          then:
+            - lambda: |-
+                uint32_t now_ms = millis();
+                if (!id(power_entity_present)) {
+                  if (id(timer_armed) && (int32_t) (now_ms - id(timer_deadline_ms)) >= 0) {
+                    id(timer_armed) = false;
+                    ESP_LOGI("quietcool-fan", "Remote timer countdown elapsed -- fan entity off (no transmit)");
+                    id(remote_power) = 2;
+                    id(sync_fan_from_remote)->execute(0, 0, false);
+                  }
+                  return;
+                }
+                #ifdef USE_API
+                // with_state_subscription: a log-viewer-only client is not Home Assistant.
+                if (!api::global_api_server->is_connected_with_state_subscription()) return;
+                #endif
+                static const uint32_t STABLE_MS = 2000;
+                uint8_t reading = id(power_reading);
+                if (reading == 0) return;
+                bool want_on = (reading == 1);
+                if (id(house_fan).state == want_on) return;
+                if ((now_ms - id(power_reading_ms)) < STABLE_MS) return;
+                if (id(last_event_ms) != 0) {
+                  uint32_t lag_ms = (id(last_event_on) ? (uint32_t) ${power_on_lag_s} : (uint32_t) ${power_off_lag_s}) * 1000UL;
+                  uint32_t since_event_ms = now_ms - id(last_event_ms);
+                  if (since_event_ms < lag_ms) return;   // inside the lag window: the event wins
+                  bool reading_changed_since_event = (int32_t) (id(power_reading_ms) - id(last_event_ms)) > 0;
+                  // The "reading must change, or power_hard_timeout_s passes" hold applies ONLY after an
+                  // ON event (a slow spin-up still reads off). After an OFF event the reading wins as
+                  // soon as the off lag window is over: if CA's RF off was lost the fan keeps running
+                  // in a sealed house, and holding the entity "off" would swallow every CA retry.
+                  if (id(last_event_on) && !reading_changed_since_event &&
+                      since_event_ms < (uint32_t) ${power_hard_timeout_s} * 1000UL) return;
+                }
+                ESP_LOGW("quietcool-fan", "Power reading (%s) disagrees with fan entity (%s) outside the lag window -- following the reading (no transmit)",
+                         want_on ? "on" : "off", id(house_fan).state ? "on" : "off");
+                id(sync_fan_from_remote)->execute(want_on ? 1 : 0, 0, false);
+            - delay: 1s
 
   # The one place a fan speed level is turned into its RF speed-select byte (Issue #10).
   - id: send_speed
@@ -635,10 +1090,18 @@ fan:
     # is always sent explicitly). on_speed_set handles changes while already on.
     # Side effect: HA's percentage attribute reads the default (e.g. 50%) while the fan is
     # off instead of 0%. The on/off state itself is unaffected.
+    #
+    # Remote-driven state (gunkl/ClimateAdvisor#1215, gunkl/ClimateAdvisor#449): a confirmed remote start/stop is mirrored onto this
+    # entity by sync_fan_from_remote (script section above) so a later HA turn_off is a real
+    # on->off edge and transmits. That mirroring raises syncing_from_remote, which every transmit
+    # below also checks -- mirroring the remote must never transmit back at it. Our own
+    # transmissions deliberately do NOT touch power_state/speed_state/timer_state (what the REMOTE
+    # last announced; it never hears us). They only start the power-reading lag window and cancel
+    # any timer countdown.
     on_turn_on:
       - if:
           condition:
-            lambda: 'return id(booted_up);'
+            lambda: 'return id(booted_up) && !id(syncing_from_remote);'
           then:
             - script.execute:
                 id: send_command
@@ -646,14 +1109,22 @@ fan:
             - script.execute:
                 id: send_speed
                 level: !lambda 'return id(house_fan).speed;'
+            - lambda: |-
+                id(last_event_ms) = millis();
+                id(last_event_on) = true;
+                id(timer_armed) = false;
     on_turn_off:
       - if:
           condition:
-            lambda: 'return id(booted_up);'
+            lambda: 'return id(booted_up) && !id(syncing_from_remote);'
           then:
             - script.execute:
                 id: send_command
                 command: 0x80
+            - lambda: |-
+                id(last_event_ms) = millis();
+                id(last_event_on) = false;
+                id(timer_armed) = false;
       - lambda: |-
           id(commanded_speed) = 0;
           id(house_fan).speed = ${fan_default_speed};
@@ -662,7 +1133,7 @@ fan:
       # default above, must never transmit), and only if on_turn_on didn't already send it.
       - if:
           condition:
-            lambda: 'return id(booted_up) && id(house_fan).state && x != id(commanded_speed);'
+            lambda: 'return id(booted_up) && !id(syncing_from_remote) && id(house_fan).state && x != id(commanded_speed);'
           then:
             - script.execute:
                 id: send_speed
@@ -707,4 +1178,3 @@ text_sensor:
     name: "QuietCool Speed"
     id: quietcool_speed_sensor
     icon: "mdi:fan"
-

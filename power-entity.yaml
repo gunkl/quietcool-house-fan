@@ -1,0 +1,65 @@
+####################################################################################################
+# OPTIONAL: ground-truth power reading for the fan entity (gunkl/ClimateAdvisor#1215).
+#
+# Add this package ALONGSIDE component.yaml (see the README). It imports a Home Assistant entity
+# that reports whether the fan is really drawing power -- e.g. an input_boolean fed by a
+# power-monitoring plug -- and turns on the reconcile logic in component.yaml: right after a remote
+# press or a command from this device the fan entity wins (the reading lags several seconds); after
+# the lag window the reading wins and corrects the entity WITHOUT transmitting. It also follows
+# changes nobody commanded (a timer running out, a wall switch, a power cut). While this package is
+# in use the remote-timer countdown fallback in component.yaml is not used.
+#
+# You MUST set power_entity in your own substitutions:, e.g.
+#     power_entity: "input_boolean.quietcool_detectpower"
+# If you forget, the placeholder below makes ESPHome stop with "Entity ID must have exactly one dot
+# in it. entity_id: SET_power_entity_in_your_substitutions" (a wrong id that does have a dot is only
+# caught at runtime by the 60 s "sends no state" warning). Your own value always overrides it.
+# Lag tuning (power_on_lag_s / power_off_lag_s / power_hard_timeout_s) lives in component.yaml's
+# substitutions block and is overridable the same way.
+#
+# Imported as a text sensor rather than a binary_sensor on purpose: the binary_sensor import silently
+# drops "unavailable"/"unknown" and keeps its last value, which would let a dead plug "win"
+# forever. Here those states arrive as text and are ignored. Requires `api:` in your config.
+####################################################################################################
+substitutions:
+  power_entity: "SET_power_entity_in_your_substitutions"
+
+# Tells component.yaml a power reading exists (so the remote-timer countdown fallback stays off and
+# the reconcile logic runs). A list item under interval:, because lists from different packages
+# concatenate safely; merging a global by id does NOT work across packages (verified: both items
+# survive and validation fails), and esphome: on_boot is a dict in component.yaml.
+interval:
+  - interval: 500ms
+    then:
+      - lambda: |-
+          id(power_entity_present) = true;
+          // Watchdog: an input_boolean fed by a plug never goes "unavailable", so a wrong or removed
+          // entity id just never reports. If HA is connected (state subscriptions) and no reading has
+          // arrived 60 s later, say so once.
+          static uint32_t api_since_ms = 0;
+          static bool warned = false;
+          uint32_t now_ms = millis();
+          bool api_up = false;
+          #ifdef USE_API
+          api_up = api::global_api_server->is_connected_with_state_subscription();
+          #endif
+          if (!api_up) {
+            api_since_ms = 0;
+          } else {
+            if (api_since_ms == 0) api_since_ms = now_ms;
+            if (id(power_reading) != 0) {
+              warned = true;   // a reading arrived; never warn for this boot
+            } else if (!warned && (now_ms - api_since_ms) > 60000) {
+              warned = true;
+              ESP_LOGW("quietcool-fan", "power entity ${power_entity} sends no state; check the entity id (and that it exists in Home Assistant)");
+            }
+          }
+
+text_sensor:
+  - platform: homeassistant
+    id: quietcool_power_reading_text
+    internal: true
+    entity_id: ${power_entity}
+    on_value:
+      then:
+        - lambda: 'id(power_reading_update)->execute(x);'

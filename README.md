@@ -137,6 +137,85 @@ decodes what the *physical wall remote* sends (including the timer buttons) and 
 Home Assistant as `event.quietcool_remote`, so a person's direct request to the remote (e.g.
 "run for 8 hours") is observable, not just commands sent by the ESP itself.
 
+**The fan entity follows the remote's power (gunkl/ClimateAdvisor#1215, gunkl/ClimateAdvisor#449):** the `fan.quietcool_whole_house_fan`
+entity used to reflect only commands sent *from Home Assistant*, so after someone started the fan
+at the remote it still read "off", and a plain `fan.turn_off` was a no-op (ESPHome only runs the
+fan's `on_turn_off`, which transmits the RF off code, on a real on-to-off change). Now the entity
+is updated to match the remote -- **without transmitting anything** -- so a later `turn_off` /
+`turn_on` from HA is always a real change and transmits.
+
+Two states are kept apart: what the *remote last announced* (changed only by remote packets, never
+by this device's own commands -- the remote cannot hear them) and the *fan entity*. A remote message
+moves the entity only when it changes what the remote announced:
+
+- **Off:** a confirmed `0x80` / `0xB0` that is a change, or the `0x80` Off action heard again (twice,
+  or once followed by `0xB0` within 0.4 s, since its first copy is often corrupted) while the entity
+  is on. A repeated `0xB0` status on its own never moves it.
+- **On:** a confirmed `0xBF`, *or any confirmed speed or timer byte* (`0x1F`/`0x3F`,
+  `0x9_`/`0xA_`/`0xB_`, including "no timer"). The remote has no dedicated power-on press, so
+  "off, then timer_1h" never sends `0xBF`; the timer byte means the fan is on.
+- **A plain wake repeating the remote's old status changes nothing** (including the first one after
+  this device reboots), so waking the remote after Home Assistant started or stopped the fan does
+  not flip the entity. A re-press of exactly what the remote already holds counts only after the
+  remote has *announced off* (so never on the first boot after flashing, before anything has been
+  announced), in a fresh interaction (a `0x66` wake or 3 s of silence), heard twice.
+- Packets equal to anything this device itself transmitted in the last 2 s are dropped as echoes
+  (so such echoes no longer fire `event.quietcool_remote`).
+
+### Optional: power reading as ground truth
+
+If you have something that reports whether the fan really draws power (for example a smart plug
+feeding an `input_boolean`), add the opt-in `power-entity.yaml` package next to `component.yaml` and
+set `power_entity`:
+
+```yaml
+substitutions:
+  power_entity: "input_boolean.quietcool_detectpower"
+  # optional tuning, defaults shown:
+  # power_on_lag_s: "20"        # measured reading lag after a start: up to 14.0 s
+  # power_off_lag_s: "25"       # measured: ~15.5 s
+  # power_hard_timeout_s: "90"
+
+packages:
+  quietcool: github://gunkl/quietcool-house-fan/component.yaml@main
+  quietcool_power: github://gunkl/quietcool-house-fan/power-entity.yaml@main
+```
+
+Right after a remote press or a command from this device the entity wins (the reading lags by
+several seconds); after the lag window the reading corrects the entity without transmitting. After
+an *on* event the reading must also have changed since then (or 90 s must pass), so a slow spin-up
+never flips an entity you just turned on. After an *off* event the reading wins as soon as
+`power_off_lag_s` has passed, so a lost RF off can never leave the entity stuck "off" and swallow
+CA's retries. A reading that changes on its own (a timer running out, a wall switch, a power cut) is
+followed once stable. "unavailable"/"unknown" is ignored (and returning to the same value counts as
+no change), and nothing is reconciled while Home Assistant is not connected (a log-viewer-only API
+client does not count).
+
+**The power entity is treated as ground truth, so keep it accurate.** If it is wrong, the fan
+entity will be corrected to match it. A wrong or removed entity id is only noticed at runtime: an
+`input_boolean` never goes unavailable, so if Home Assistant is connected and no reading arrives for
+60 s the log shows `power entity <id> sends no state; check the entity id`. If you forget to set
+`power_entity` at all, ESPHome stops with `Entity ID must have exactly one dot in it. entity_id:
+SET_power_entity_in_your_substitutions`.
+
+Without the power package, a confirmed remote `timer_Nh` turns the entity off after N hours
+instead. The countdown is held in RAM only: a reboot forgets it (the entity then keeps its
+restored state until the next press).
+It needs `api:` in your config. No new minimum ESPHome version is required by this change (nothing
+beyond the features `component.yaml` already used, plus text sensors and `packages:`), but it has
+only been validated on ESPHome 2026.10.1. Paste-in install: ESPHome fails hard on a duplicate
+top-level key, so if your own file already has `packages:`, `text_sensor:` or `interval:`, merge by
+hand; `power-entity.yaml` adds `text_sensor:` and `interval:`. (Merging a global by id across
+packages does not work in ESPHome, which is why the package uses an interval instead.)
+
+Limits: pressing exactly the value the remote already holds while it believes the fan is on, the
+very first press after a reboot, and a wall-switch off are not visible to the receiver without the
+power reading. What the remote last announced (`remote_power`) is kept in flash so a reboot does
+not read the remote's stale wake as a press. ESPHome writes it to flash on its preferences
+`flash_write_interval` (60 s by default; a clean reboot or OTA flushes it at once), so a power
+cut within about 60 s of a change restores the previous value. See [docs/remote-capture-protocol.md](docs/remote-capture-protocol.md) for the full
+case table.
+
 **Ambient speed sensor (Climate Advisor speed-aware remote integration):** in addition to the
 `event.quietcool_remote` entity above (which reports discrete *presses*), this fork also exposes
 a `text_sensor.quietcool_speed` reporting the firmware's already-internally-tracked current
