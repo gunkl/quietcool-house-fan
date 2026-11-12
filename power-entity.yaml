@@ -7,7 +7,7 @@
 # press or a command from this device the fan entity wins (the reading lags several seconds); after
 # the lag window the reading wins and corrects the entity WITHOUT transmitting. It also follows
 # changes nobody commanded (a timer running out, a wall switch, a power cut). While this package is
-# in use the remote-timer countdown fallback in component.yaml is not used.
+# in use a timer running out no longer switches the entity off by itself; the reading does.
 #
 # You MUST set power_entity in your own substitutions:, e.g.
 #     power_entity: "input_boolean.quietcool_detectpower"
@@ -24,7 +24,7 @@
 substitutions:
   power_entity: "SET_power_entity_in_your_substitutions"
 
-# Tells component.yaml a power reading exists (so the remote-timer countdown fallback stays off and
+# Tells component.yaml a power reading exists (so a timer running out is left to the reading, and
 # the reconcile logic runs). A list item under interval:, because lists from different packages
 # concatenate safely; merging a global by id does NOT work across packages (verified: both items
 # survive and validation fails), and esphome: on_boot is a dict in component.yaml.

@@ -221,14 +221,21 @@ globals:
     restore_value: false
     initial_value: '0'
 
-  # Timer countdown fallback (only with NO power-entity package): a remote timer that runs out transmits
-  # nothing, so without a power reading the entity would read "on" forever.
+  # Timer countdown: tracks the fan's own timer, whether it was started at the remote or from Home
+  # Assistant (the QuietCool Timer select below). It feeds the select/remaining-time entities. When it
+  # runs out, and only WITHOUT the power-entity package, the entity is mirrored off: a timer that runs
+  # out transmits nothing, so without a power reading the entity would read "on" forever. With the
+  # package the reading decides instead.
   - id: timer_armed
     type: bool
     restore_value: false
     initial_value: 'false'
   - id: timer_deadline_ms
     type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: timer_set_hours    # duration of the armed timer (1/2/4/8/12), for the select entity
+    type: uint8_t
     restore_value: false
     initial_value: '0'
 
@@ -710,11 +717,14 @@ cc1101:
                 // (same duration, e.g. 0x91 -> 0xB1) and speed-field presses leave it alone, and an
                 // unchanged fresh re-press re-arms it via remote_hint. The first confirmation after
                 // boot (prev_timer == 0) is left to remote_hint, so a stale wake cannot arm it.
-                if (!id(power_entity_present) && prev_timer != 0) {
+                // Always tracked (it also feeds the timer select/remaining entities); only the
+                // mirror-off at expiry is skipped when the power-entity package is in use.
+                if (prev_timer != 0) {
                   if (is_no_timer) {
                     id(timer_armed) = false;
                   } else if ((prev_timer & 0x0F) != timer_value || was_off) {
                     id(timer_deadline_ms) = now_ms + (uint32_t) timer_hours * 3600000UL;
+                    id(timer_set_hours) = (uint8_t) timer_hours;
                     id(timer_armed) = true;
                   }
                 }
@@ -851,6 +861,8 @@ script:
             changed = true;
           }
           if (!changed) return;
+          // Whatever turned the entity off (remote, power reading, countdown), no timer is running.
+          if (state_changed && !id(house_fan).state) id(timer_armed) = false;
           if (state_changed && record) {
             id(last_event_ms) = millis();
             id(last_event_on) = id(house_fan).state;
@@ -924,11 +936,12 @@ script:
               // it) -- but a re-arm needs a countdown already running or this very call turning the
               // fan on; otherwise a stale wake re-sending e.g. 0x91 after the timer expired and CA
               // restarted the fan would arm a countdown that switches the entity off an hour later.
-              if (!id(power_entity_present) && hours >= 0) {
+              if (hours >= 0) {
                 if (hours == 0) {
                   id(timer_armed) = false;
                 } else if (id(timer_armed) || turns_on) {
                   id(timer_deadline_ms) = now_ms + (uint32_t) hours * 3600000UL;
+                  id(timer_set_hours) = (uint8_t) hours;
                   id(timer_armed) = true;
                 }
               }
@@ -996,7 +1009,8 @@ script:
   # Once per second, started from on_boot (a looping script rather than an interval: block, so the
   # paste-in install does not gain a top-level key that may collide with your own).
   #  - WITH the power-entity package: reconcile the entity with the power reading (see below).
-  #  - WITHOUT it: mirror "off" when a remote timer's countdown has elapsed.
+  #  - Always: keep the timer select / remaining-time entities current; when a timer (remote or HA)
+  #    has elapsed, and only WITHOUT the power-entity package, mirror "off".
   # Reading-vs-entity rule (it lags a real change by up to ~14 s on / ~15.5 s off):
   #  - disagreement inside the lag window after the last remote press / our own transmission: the
   #    event wins, the reading is ignored;
@@ -1018,15 +1032,36 @@ script:
           then:
             - lambda: |-
                 uint32_t now_ms = millis();
-                if (!id(power_entity_present)) {
-                  if (id(timer_armed) && (int32_t) (now_ms - id(timer_deadline_ms)) >= 0) {
-                    id(timer_armed) = false;
-                    ESP_LOGI("quietcool-fan", "Remote timer countdown elapsed -- fan entity off (no transmit)");
+                if (id(timer_armed) && (int32_t) (now_ms - id(timer_deadline_ms)) >= 0) {
+                  id(timer_armed) = false;
+                  if (!id(power_entity_present)) {
+                    ESP_LOGI("quietcool-fan", "Timer countdown elapsed -- fan entity off (no transmit)");
                     id(remote_power) = 2;
                     id(sync_fan_from_remote)->execute(0, 0, false);
+                  } else {
+                    ESP_LOGI("quietcool-fan", "Timer countdown elapsed -- the power reading decides the fan entity");
                   }
-                  return;
                 }
+                // Timer select / remaining-time entities: published only when their value changes.
+                {
+                  static std::string shown_option = "";
+                  static int shown_minutes = -1;
+                  std::string option = "None";
+                  int minutes = 0;
+                  if (id(timer_armed)) {
+                    option = std::to_string((int) id(timer_set_hours)) + "h";
+                    minutes = (int) ((id(timer_deadline_ms) - now_ms + 59999UL) / 60000UL);
+                  }
+                  if (option != shown_option) {
+                    shown_option = option;
+                    id(quietcool_timer_select).publish_state(option);
+                  }
+                  if (minutes != shown_minutes) {
+                    shown_minutes = minutes;
+                    id(quietcool_timer_remaining).publish_state(minutes);
+                  }
+                }
+                if (!id(power_entity_present)) return;
                 #ifdef USE_API
                 // with_state_subscription: a log-viewer-only client is not Home Assistant.
                 if (!api::global_api_server->is_connected_with_state_subscription()) return;
@@ -1064,6 +1099,48 @@ script:
       - script.execute:
           id: send_command
           command: !lambda 'return level >= 2 ? 0x3f : 0x1f;'
+
+  # Start (or cancel) the fan's own timer from Home Assistant -- the QuietCool Timer select below.
+  #   hours: 1/2/4/8/12 = run for that long, 0 = cancel the timer (the fan keeps running).
+  # Sends exactly the byte the physical remote sends for that timer button: the high nibble carries
+  # the speed (0x9_ LOW, 0xB_ HIGH), the low nibble the hours (1,2,4,8,C=12; F = no timer). The fan
+  # runs the timer itself (a remote timer that runs out transmits nothing), and a timer byte also
+  # turns a stopped fan on -- the remote sends no 0xBF for "off, then timer_1h" -- so nothing else is
+  # sent. The entity is then mirrored on without a second transmission, and the countdown armed so
+  # the entity goes off when the fan's timer runs out (see reconcile_loop).
+  - id: ha_set_timer
+    mode: queued
+    parameters:
+      hours: int
+    then:
+      - lambda: |-
+          if (!id(booted_up)) return;
+          bool on = id(house_fan).state;
+          int level = (on ? id(house_fan).speed : ${fan_default_speed}) >= 2 ? 2 : 1;
+          uint8_t family = (level >= 2) ? 0xB0 : 0x90;
+          if (hours <= 0) {
+            id(timer_armed) = false;
+            if (!on) return;   // fan stopped: no timer to cancel, and "no timer" would turn it on
+            ESP_LOGI("quietcool-fan", "Timer cancelled from HA (fan keeps running)");
+            id(send_command)->execute(family | 0x0F);
+            return;
+          }
+          if (hours != 1 && hours != 2 && hours != 4 && hours != 8 && hours != 12) {
+            ESP_LOGW("quietcool-fan", "Unsupported timer duration %dh ignored", hours);
+            return;
+          }
+          uint8_t nibble = (hours == 12) ? 0x0C : (uint8_t) hours;
+          ESP_LOGI("quietcool-fan", "Timer %dh from HA at %s speed", hours, level >= 2 ? "HIGH" : "LOW");
+          id(send_command)->execute(family | nibble);
+          if (!on) {
+            // The timer byte itself turned the fan on: mirror it, without sending 0xBF + speed.
+            id(sync_fan_from_remote)->execute(1, level, true);
+          }
+          id(last_event_ms) = millis();
+          id(last_event_on) = true;
+          id(timer_deadline_ms) = millis() + (uint32_t) hours * 3600000UL;
+          id(timer_set_hours) = (uint8_t) hours;
+          id(timer_armed) = true;
 
 fan:
   - platform: template
@@ -1178,3 +1255,41 @@ text_sensor:
     name: "QuietCool Speed"
     id: quietcool_speed_sensor
     icon: "mdi:fan"
+
+####################################################################################################
+# Timer: set the fan's own timer from Home Assistant, and see the one that is running.
+# Picking 1h..12h transmits the remote's timer byte at the current speed (or fan_default_speed if the
+# fan is off, which also turns it on). Picking "None" cancels the timer and leaves the fan running.
+# The select also follows timer presses on the physical remote, and drops back to "None" when the
+# timer runs out or the fan is turned off by any means. The countdown lives in RAM: a reboot of this
+# device forgets it (the fan's own timer keeps running).
+####################################################################################################
+select:
+  - platform: template
+    name: "QuietCool Timer"
+    id: quietcool_timer_select
+    icon: "mdi:timer-outline"
+    optimistic: false
+    options:
+      - "None"
+      - "1h"
+      - "2h"
+      - "4h"
+      - "8h"
+      - "12h"
+    initial_option: "None"
+    set_action:
+      - script.execute:
+          id: ha_set_timer
+          hours: !lambda |-
+            return x == "1h" ? 1 : x == "2h" ? 2 : x == "4h" ? 4 : x == "8h" ? 8 : x == "12h" ? 12 : 0;
+
+sensor:
+  - platform: template
+    name: "QuietCool Timer Remaining"
+    id: quietcool_timer_remaining
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "min"
+    device_class: duration
+    accuracy_decimals: 0
+    update_interval: never

@@ -201,10 +201,27 @@ SET_power_entity_in_your_substitutions`.
 Without the power package, a confirmed remote `timer_Nh` turns the entity off after N hours
 instead. The countdown is held in RAM only: a reboot forgets it (the entity then keeps its
 restored state until the next press).
+
+### Timer from Home Assistant
+
+Two more entities expose the fan's own timer:
+
+- **`select.quietcool_timer`** (`None`, `1h`, `2h`, `4h`, `8h`, `12h`). Picking a duration sends the
+  same byte as the remote's timer button, at the fan's current speed (or `fan_default_speed` if the
+  fan is off, which also starts it). The fan runs the timer itself, just as with the remote. Picking
+  `None` cancels the timer and leaves the fan running. Use it in automations with
+  `select.select_option`.
+- **`sensor.quietcool_timer_remaining`**: minutes left on the timer (0 when none is running).
+
+Both follow the remote too: a timer button pressed on the remote shows up here, and either
+entity returns to `None` / 0 when the timer runs out or the fan is turned off in any way. When the
+timer runs out the fan entity goes off without transmitting (with the power package, the reading
+decides instead). Like the remote countdown, this is held in RAM: if this device reboots mid-timer,
+the select shows `None` but the fan still stops on its own schedule.
 It needs `api:` in your config. No new minimum ESPHome version is required by this change (nothing
 beyond the features `component.yaml` already used, plus text sensors and `packages:`), but it has
 only been validated on ESPHome 2026.10.1. Paste-in install: ESPHome fails hard on a duplicate
-top-level key, so if your own file already has `packages:`, `text_sensor:` or `interval:`, merge by
+top-level key, so if your own file already has `packages:`, `text_sensor:`, `select:`, `sensor:` or `interval:`, merge by
 hand; `power-entity.yaml` adds `text_sensor:` and `interval:`. (Merging a global by id across
 packages does not work in ESPHome, which is why the package uses an interval instead.)
 
