@@ -30,6 +30,8 @@ substitutions:
   # plain on/off toggle, or an automation calling fan.turn_on with no percentage. "1" = LOW,
   # "2" = HIGH. Choosing a speed explicitly (e.g. picking HIGH in the HA fan card) always wins
   # over this default. "1" (LOW) preserves this component's behavior from before this setting.
+  # This is only the starting value: the "QuietCool On Speed" select in Home Assistant changes it at
+  # runtime, and its choice is kept across reboots (so editing this later has no effect once set).
   fan_default_speed: "1"
   # Tuning for the OPTIONAL power-entity package (power-entity.yaml, see README); harmless defaults
   # otherwise. The power reading lags a real change. Measured (gunkl/ClimateAdvisor#1215 production
@@ -70,14 +72,25 @@ esphome:
           // older version (which persisted speed=0 while off), and one whose fan_default_speed
           // was just changed. Not published: nothing transmits. HA picks the value up on its next
           // state sync (an already-connected HA may show 0% until then, which is cosmetic only).
+          // The "On speed" select (below) can change that default at runtime; its value is kept in
+          // the on_speed global, which survives reboots. fan_default_speed is its first-boot value.
+          if (id(on_speed) < 1 || id(on_speed) > 2) id(on_speed) = ${fan_default_speed};
           if (!id(house_fan).state) {
-            id(house_fan).speed = ${fan_default_speed};
+            id(house_fan).speed = id(on_speed);
           }
+          id(quietcool_on_speed_select).publish_state(id(on_speed) >= 2 ? "High" : "Low");
       - delay: 2s      # comfortably longer than template-entity restore/apply takes
       - lambda: 'id(booted_up) = true;'
       - script.execute: reconcile_loop
 
 globals:
+  # Speed a plain "turn on" uses (1 = LOW, 2 = HIGH): the "QuietCool On Speed" select. Starts at
+  # fan_default_speed; after that the select's choice is kept across reboots.
+  - id: on_speed
+    type: int
+    restore_value: true
+    initial_value: '${fan_default_speed}'
+
   - id: booted_up
     type: bool
     restore_value: false
@@ -1060,6 +1073,17 @@ script:
                     shown_minutes = minutes;
                     id(quietcool_timer_remaining).publish_state(minutes);
                   }
+                  // The fan entity's preset shows the same timer, so the plain fan controls on a
+                  // dashboard can see and set it. Re-applied whenever it differs: HA clears a fan's
+                  // preset on any speed change, but the fan's own timer keeps running.
+                  const char *want_preset = (option == "None") ? "No timer" : option.c_str();
+                  if (!(id(house_fan).get_preset_mode() == want_preset)) {
+                    id(syncing_from_remote) = true;
+                    auto call = id(house_fan).make_call();
+                    call.set_preset_mode(want_preset);
+                    call.perform();
+                    id(syncing_from_remote) = false;
+                  }
                 }
                 if (!id(power_entity_present)) return;
                 #ifdef USE_API
@@ -1116,7 +1140,7 @@ script:
       - lambda: |-
           if (!id(booted_up)) return;
           bool on = id(house_fan).state;
-          int level = (on ? id(house_fan).speed : ${fan_default_speed}) >= 2 ? 2 : 1;
+          int level = (on ? id(house_fan).speed : id(on_speed)) >= 2 ? 2 : 1;
           uint8_t family = (level >= 2) ? 0xB0 : 0x90;
           if (hours <= 0) {
             id(timer_armed) = false;
@@ -1148,6 +1172,26 @@ fan:
     id: house_fan
     speed_count: 2
     restore_mode: RESTORE_DEFAULT_OFF
+    # Timer presets: the same timer as the QuietCool Timer select, on the fan entity itself so the
+    # standard fan controls (more-info dialog, tile card "Fan preset modes" feature) can set it.
+    # Picking one starts the fan if it is off; "No timer" cancels a running timer.
+    preset_modes:
+      - "No timer"
+      - "1h"
+      - "2h"
+      - "4h"
+      - "8h"
+      - "12h"
+    on_preset_set:
+      # Skips our own preset re-sync (reconcile_loop) and HA's "a speed change clears the preset".
+      - if:
+          condition:
+            lambda: 'return !id(syncing_from_remote) && !x.empty();'
+          then:
+            - script.execute:
+                id: ha_set_timer
+                hours: !lambda |-
+                  return x == "1h" ? 1 : x == "2h" ? 2 : x == "4h" ? 4 : x == "8h" ? 8 : x == "12h" ? 12 : 0;
     # Every transmit below is gated on id(booted_up) (see the boot guard at the top of this file)
     # so that RESTORE_DEFAULT_OFF's boot-time state replay updates the entity's reported state
     # without re-commanding the physical fan. Only genuine post-boot triggers actually transmit.
@@ -1204,7 +1248,7 @@ fan:
                 id(timer_armed) = false;
       - lambda: |-
           id(commanded_speed) = 0;
-          id(house_fan).speed = ${fan_default_speed};
+          id(house_fan).speed = id(on_speed);
     on_speed_set:
       # Only while on (a speed change while off, including on_turn_off's own reset to the
       # default above, must never transmit), and only if on_turn_on didn't already send it.
@@ -1283,6 +1327,25 @@ select:
           id: ha_set_timer
           hours: !lambda |-
             return x == "1h" ? 1 : x == "2h" ? 2 : x == "4h" ? 4 : x == "8h" ? 8 : x == "12h" ? 12 : 0;
+
+  # Speed the fan starts at when it is turned on without a speed (a plain on/off toggle, or
+  # fan.turn_on with no percentage). Picking a speed explicitly still wins. Applies from the next
+  # turn-on; it does not change the speed of a fan that is already running.
+  - platform: template
+    name: "QuietCool On Speed"
+    id: quietcool_on_speed_select
+    icon: "mdi:fan-chevron-up"
+    entity_category: config
+    optimistic: false
+    options:
+      - "Low"
+      - "High"
+    set_action:
+      - lambda: |-
+          id(on_speed) = (x == "High") ? 2 : 1;
+          // While off the fan's speed field holds the turn-on speed (see on_turn_off).
+          if (!id(house_fan).state) id(house_fan).speed = id(on_speed);
+          id(quietcool_on_speed_select).publish_state(id(on_speed) >= 2 ? "High" : "Low");
 
 sensor:
   - platform: template

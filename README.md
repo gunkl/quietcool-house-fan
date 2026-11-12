@@ -213,7 +213,15 @@ Two more entities expose the fan's own timer:
   `select.select_option`.
 - **`sensor.quietcool_timer_remaining`**: minutes left on the timer (0 when none is running).
 
-Both follow the remote too: a timer button pressed on the remote shows up here, and either
+- **Fan presets**: the same timers (`No timer`, `1h` … `12h`) are also the fan entity's preset
+  modes. The standard fan controls can therefore set the timer: the more-info dialog, or a Tile card
+  with the **Fan preset modes** feature (add **Fan speed** to the same card for speed). Picking
+  a preset starts the fan if it is off.
+- **`select.quietcool_on_speed`** (`Low` / `High`, under the device's Configuration): the speed a
+  plain "on" uses, e.g. the toggle on a dashboard. Choosing a speed explicitly still wins. It starts at
+  `fan_default_speed` and keeps your choice across reboots.
+
+All of these follow the remote too: a timer button pressed on the remote shows up here, and either
 entity returns to `None` / 0 when the timer runs out or the fan is turned off in any way. When the
 timer runs out the fan entity goes off without transmitting (with the power package, the reading
 decides instead). Like the remote countdown, this is held in RAM: if this device reboots mid-timer,
