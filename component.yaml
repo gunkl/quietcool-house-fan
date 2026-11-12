@@ -815,6 +815,19 @@ script:
             id(sent_cmds_ms)[ring_i] = id(last_sent_command_ms);
             id(sent_cmds_idx) = (ring_i + 1) % 8;
           }
+          // Keep the QuietCool Speed sensor in step with speeds WE command too, not only the remote's:
+          // speed-select 0x1F/0x3F, and the speed family of turn-on/timer bytes (0x9_ LOW, 0xB_ HIGH;
+          // 0xB0 is off and carries no speed). Only the sensor -- what the remote last announced
+          // (speed_state) is left alone, since the remote never hears us.
+          {
+            uint8_t c = (uint8_t) command;
+            const char *spoken = nullptr;
+            if (c == 0x1f || (c & 0xF0) == 0x90) spoken = "low";
+            else if (c == 0x3f || ((c & 0xF0) == 0xB0 && c != 0xb0)) spoken = "high";
+            if (spoken != nullptr) {
+              id(quietcool_speed_sensor).publish_state(spoken);
+            }
+          }
       - cc1101.send_packet:
           data: !lambda |-
             std::vector<uint8_t> packet(id(remote_id), id(remote_id)+4);

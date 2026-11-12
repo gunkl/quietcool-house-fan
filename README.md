@@ -247,7 +247,9 @@ a `text_sensor.quietcool_speed` reporting the firmware's already-internally-trac
 speed as a continuously-readable *state*. It's fed from the same speed-context bit embedded in
 every status-beacon byte (speed, timer, AND power families — see the packet-format table above),
 not just explicit speed-select presses, so it stays accurate across a whole session even if the
-user never presses a dedicated speed button. Purely additive: zero change to the event entity's
+user never presses a dedicated speed button. It also follows the speed this device itself
+commands (a speed change, turn-on or timer from Home Assistant), so it shows the fan's current
+speed whichever side changed it. Purely additive: zero change to the event entity's
 schema or semantics. See [docs/remote-capture-protocol.md](docs/remote-capture-protocol.md) for
 why a separate entity was chosen over overloading the event stream.
 
