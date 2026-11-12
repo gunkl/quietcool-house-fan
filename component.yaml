@@ -1206,9 +1206,9 @@ fan:
     #
     # Now, while OFF, the speed field holds fan_default_speed instead of 0 (set in on_turn_off
     # and re-applied at boot). So a plain turn-on keeps that default, and an explicit speed
-    # replaces it. on_turn_on never overwrites the requested speed. It transmits power-on and
-    # then the actual target speed (the hardware's own power-on default is HIGH, so the speed
-    # is always sent explicitly). on_speed_set handles changes while already on.
+    # replaces it. on_turn_on never overwrites the requested speed. It transmits one byte that
+    # turns the fan on at the target speed (0x9F LOW, 0xBF HIGH -- the same bytes the remote
+    # sends). on_speed_set handles changes while already on.
     # Side effect: HA's percentage attribute reads the default (e.g. 50%) while the fan is
     # off instead of 0%. The on/off state itself is unaffected.
     #
@@ -1224,13 +1224,16 @@ fan:
           condition:
             lambda: 'return id(booted_up) && !id(syncing_from_remote);'
           then:
+            # One byte, exactly as the remote starts the fan: the "no timer" status byte at the
+            # wanted speed -- 0x9F = on at LOW, 0xBF = on at HIGH. Sending 0xBF and then a separate
+            # speed byte (the old way) left the fan at HIGH: 0xBF itself means "on at HIGH" and the
+            # fan ignored the speed byte that followed ~140 ms later.
             - script.execute:
                 id: send_command
-                command: 0xbf
-            - script.execute:
-                id: send_speed
-                level: !lambda 'return id(house_fan).speed;'
+                command: !lambda 'return id(house_fan).speed >= 2 ? 0xbf : 0x9f;'
             - lambda: |-
+                // on_speed_set runs in this same state update; this stops it re-sending the speed.
+                id(commanded_speed) = id(house_fan).speed >= 2 ? 2 : 1;
                 id(last_event_ms) = millis();
                 id(last_event_on) = true;
                 id(timer_armed) = false;
