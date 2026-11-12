@@ -149,7 +149,7 @@ globals:
   # The remote has no dedicated power-on press: 0xBF is just "timer=none, speed=high", and a
   # power-up "does not reliably re-transmit" anything (docs/remote-capture-protocol.md, "Interpretation
   # rule for consumers"). So house_fan mirrors "on" from ANY confirmed speed/timer/0xBF byte, and
-  # "off" only from a confirmed 0x80/0xB0. The globals below keep a post-off status beacon from
+  # "off" only from a confirmed 0x80/0xB0/0x90. The globals below keep a post-off status beacon from
   # flipping the entity back on: an UNCHANGED (already-held) byte only counts as a power-on when it
   # belongs to a fresh interaction (see remote_hint in the script section).
   #   last_remote_rx_ms  when we last heard ANY packet from our remote (0 = never)
@@ -450,7 +450,8 @@ cc1101:
           const char *name = "UNKNOWN";
           if (cmd == 0x66) name = "KNOWN(wake)";
           else if (cmd == 0x80) name = "KNOWN(power=off, action)";
-          else if (cmd == 0xb0) name = "KNOWN(power=off, status)";
+          else if (cmd == 0xb0) name = "KNOWN(power=off, status, speed=high)";
+          else if (cmd == 0x90) name = "KNOWN(power=off, status, speed=low)";
           else if (cmd == 0xbf) name = "KNOWN(power=on)";
           else if (cmd == 0x1f) name = "KNOWN(speed=low)";
           else if (cmd == 0x2f) name = "KNOWN(speed=medium, untested)";
@@ -517,9 +518,15 @@ cc1101:
           // moments after a 0x80 doesn't double-fire. There is no equivalent second byte for
           // On: On's status *is* whatever Speed is currently held, so it needs no separate
           // status byte of its own. See docs/remote-capture-protocol.md.
-          if (cmd == 0xbf || cmd == 0x80 || cmd == 0xb0) {
+          // Off status is 0xB0 at HIGH and 0x90 at LOW (the same 0x20 speed bit as the timer family;
+          // 0x90 confirmed from a live capture of Off pressed at LOW, which sent no 0x80 at all).
+          if (cmd == 0xbf || cmd == 0x80 || cmd == 0xb0 || cmd == 0x90) {
             uint8_t normalized = (cmd == 0xbf) ? 0xbf : 0x80;
-            if (normalized == id(power_state)) {
+            // An off after the remote announced ON through a timer or speed byte is a change even
+            // though power_state still holds the earlier off: those bytes never touch power_state
+            // (e.g. off, timer_1h (0x91), off (0x90 only) -- the second off must not be dropped).
+            bool off_after_implied_on = (normalized == 0x80 && id(remote_power) == 1);
+            if (normalized == id(power_state) && !off_after_implied_on) {
               // Unchanged vs what the remote already announced: not a press by itself (a plain wake
               // just repeats it). remote_hint decides whether it is a fresh re-press (gunkl/ClimateAdvisor#1215).
               id(remote_hint)->execute(normalized == 0xbf, normalized == 0xbf ? 2 : 0, false, cmd, -1);
@@ -588,7 +595,9 @@ cc1101:
                 if (normalized == 0xbf) {
                   id(remote_hint)->execute(true, 2, prev_power != 0, cmd, prev_power == 0 ? 0 : -1);
                 } else {
-                  id(remote_hint)->execute(false, 0, prev_power != 0, cmd, -1);
+                  // remote_power (persisted) said ON, so this off is new even as the first power
+                  // confirmation since boot: a stale beacon would repeat that ON, not an off.
+                  id(remote_hint)->execute(false, 0, prev_power != 0 || off_after_implied_on, cmd, -1);
                   id(implied_off_count) = 0;
                   // The off burst and the status beacon trailing it must not look like a new
                   // interaction to remote_hint.
@@ -822,7 +831,7 @@ script:
           {
             uint8_t c = (uint8_t) command;
             const char *spoken = nullptr;
-            if (c == 0x1f || (c & 0xF0) == 0x90) spoken = "low";
+            if (c == 0x1f || ((c & 0xF0) == 0x90 && c != 0x90)) spoken = "low";
             else if (c == 0x3f || ((c & 0xF0) == 0xB0 && c != 0xb0)) spoken = "high";
             if (spoken != nullptr) {
               id(quietcool_speed_sensor).publish_state(spoken);
@@ -906,7 +915,7 @@ script:
 
   # What a confirmed (or re-heard) remote byte means for the ENTITY (gunkl/ClimateAdvisor#1215).
   #   wants_on: the byte says or implies the fan is on (0xBF, a speed byte, any timer-family byte);
-  #             false = the off bytes 0x80/0xB0.
+  #             false = the off bytes 0x80/0xB0/0x90.
   #   changed:  it reached its field's CONFIRM block with a previous held value (a real press);
   #             false = an already-held value heard again, OR the first confirmation of that field
   #             since boot (a stale status re-sent after a reboot).
@@ -923,7 +932,7 @@ script:
   #    indistinguishable from a plain wake re-sending stale status, so it changes nothing. The same
   #    accepted re-press re-arms the timer countdown;
   #  - CHANGED off-byte: the entity goes off;
-  #  - UNCHANGED off-byte: 0xB0 (the status beacon a wake re-sends) NEVER moves the entity. 0x80 (the
+  #  - UNCHANGED off-byte: 0xB0/0x90 (the status beacon a wake re-sends) NEVER moves the entity. 0x80 (the
   #    action byte, sent only when Off is pressed) heard twice while the entity is on counts as an
   #    off press whatever remote_power says -- this is also how "CA on, remote held off, remote off
   #    pressed" is seen.
@@ -988,10 +997,10 @@ script:
               // copy is often corrupted, so one 0x80 followed by a 0xB0 within the same-burst
               // tolerance also counts (an off press is announced as 0x80 then the 0xB0 status).
               static const uint32_t SAME_BURST_TOLERANCE_MS = 400;
-              if (raw != 0x80 && raw != 0xB0) return;
+              if (raw != 0x80 && raw != 0xB0 && raw != 0x90) return;
               if (!id(house_fan).state) return;
               if (id(last_sent_command_ms) != 0 && (now_ms - id(last_sent_command_ms)) < OWN_TX_QUIET_MS) return;
-              if (raw == 0xB0) {
+              if (raw == 0xB0 || raw == 0x90) {
                 if (!(id(implied_off_count) == 1 && (now_ms - id(implied_off_ms)) <= SAME_BURST_TOLERANCE_MS)) return;
                 id(implied_off_count) = 2;
               } else if (id(implied_off_count) > 0 && (now_ms - id(implied_off_ms)) <= CONFIRM_WINDOW_MS) {

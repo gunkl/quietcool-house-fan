@@ -95,6 +95,7 @@ Each packet is sent 3 times, separated by 70ms. The command codes are:
 | Power: On (speed=high ctx) | 0xBF  | Confirmed — see "speed-context flag bit" below |
 | Power: Off (action)        | 0x80  | Confirmed — dedicated isolated capture |
 | Power: Off (status, speed=high ctx) | 0xB0 | Confirmed |
+| Power: Off (status, speed=low ctx)  | 0x90 | Confirmed — live capture of Off pressed at LOW on one remote (no `0x80` sent at all) |
 | Speed: Low                 | 0x1F  | Confirmed |
 | Speed: Medium              | 0x2F  | **Untested/assumed** — falls directly between Low and High in the speed family; this fan is 2-speed and can't exercise it, documented as if it functioned |
 | Speed: High                | 0x3F  | Confirmed |
@@ -148,7 +149,8 @@ Two states are kept apart: what the *remote last announced* (changed only by rem
 by this device's own commands -- the remote cannot hear them) and the *fan entity*. A remote message
 moves the entity only when it changes what the remote announced:
 
-- **Off:** a confirmed `0x80` / `0xB0` that is a change, or the `0x80` Off action heard again (twice,
+- **Off:** a confirmed `0x80` / `0xB0` / `0x90` that is a change (including any off after the remote
+  announced on through a timer or speed byte), or the `0x80` Off action heard again (twice,
   or once followed by `0xB0` within 0.4 s, since its first copy is often corrupted) while the entity
   is on. A repeated `0xB0` status on its own never moves it.
 - **On:** a confirmed `0xBF`, *or any confirmed speed or timer byte* (`0x1F`/`0x3F`,
