@@ -26,7 +26,7 @@ Once you have your hardware all squared away, you'll need [ESPHome](https://esph
 
 ### Recommended: `packages:` + `substitutions:` (survives future updates)
 
-All of your per-device settings — remote ID, CC1101 wiring, radio frequency, default "on" speed — live in one `substitutions:` block at the very top of [component.yaml](component.yaml). Rather than editing that file directly, add a `packages:` entry to your own dashboard file that pulls it in, and override just the values you need:
+All of your per-device settings — remote ID, remote type, CC1101 wiring, radio frequency, default "on" speed — live in one `substitutions:` block at the very top of [component.yaml](component.yaml). Rather than editing that file directly, add a `packages:` entry to your own dashboard file that pulls it in, and override just the values you need:
 
 ```yaml
 substitutions:
@@ -35,6 +35,7 @@ substitutions:
   remote_id_2: "0xcc"   # your remote's actual ID -- see below for how to read it
   remote_id_3: "0x27"
   fan_default_speed: "2"   # speed for a plain "turn on" with no speed chosen: 1 = LOW (default), 2 = HIGH
+  remote_type: "glass"     # "glass" (default, the touch-glass remote) or "legacy" -- see "Remote type" below
   # Only list the ones that differ from component.yaml's own defaults --
   # cc1101_clk_pin, cc1101_frequency, etc. are all overridable the same way.
 
@@ -53,6 +54,43 @@ With this setup, "updating the firmware" is just recompiling — ESPHome pulls t
 If you'd rather not use `packages:` (e.g. you're offline, or want to freeze a specific version), you can still paste the entire contents of [component.yaml](component.yaml) at the end of your wizard-generated file. All the values you'd ever need to change are consolidated in the `substitutions:` block at the very top of the pasted content — edit those in place, and leave everything below the "you shouldn't need to change anything below this line" marker alone. The trade-off: any time you re-paste an updated component.yaml, you'll need to re-apply your edits to that block by hand.
 
 Either way, install to the ESP32 using the ESPHome dashboard, and you should now be able to control your house fan. If you're using ESPHome in Home Assistant it should show up as a fan device. If you're not using Home Assistant you can add `web_server:` to your config and navigate to the device's IP address (visible from the device logs in ESPHome) in a browser and control it from there.
+
+### Remote type and RF codes
+
+QuietCool fans don't all use the same codes. `remote_type` picks which set this device sends and
+understands:
+
+| | `glass` (default) | `legacy` |
+|---|---|---|
+| Which fans | The touch-glass remote this component was built and tested on | An older remote/fan, contributed in [#14](https://github.com/gunkl/quietcool-house-fan/pull/14) |
+| Turn on at LOW / HIGH | `0xBF` then `0x1F` / `0xBF` then `0x3F` | `0x9F` / `0xBF` (one byte) |
+| Off, speed change | `0x80`; `0x1F` / `0x3F` | same |
+| Timer 1h/2h/4h/8h/12h at LOW / HIGH | `0x91 0x92 0x94 0x98 0x9C` / `0xB1 0xB2 0xB4 0xB8 0xBC` | same |
+| Remote's "off" at LOW | `0x80`/`0xB0` (same as at HIGH) | `0x90`, with no `0x80` |
+
+Every code is a substitution (`glass_code_*`, `legacy_code_*`, `*_codes_timer_*` at the top of
+[component.yaml](component.yaml)), so to test or troubleshoot you can override any single one in
+your own `substitutions:` without editing the file, e.g. `glass_code_speed_low: "0x1f"`. A wrong
+`remote_type` or a code outside `0x00`-`0xFF` stops the build with an error.
+
+### Fan timer from Home Assistant
+
+The fan entity has **timer presets**: `No timer`, `1h`, `2h`, `4h`, `8h`, `12h`. Pick one from the
+fan's more-info dialog, or add the **Fan preset modes** feature to a Tile card next to on/off and
+speed. The fan runs the timer itself, exactly as with the remote's timer button.
+
+- **Fan on:** the timer is sent right away, at the fan's current speed.
+- **Fan off:** nothing is sent (a timer code would start the fan). The choice is held for 30 s: turn
+  the fan on from Home Assistant within that time and the timer is sent right after the turn-on, at
+  that speed. Otherwise it is cleared.
+- **No timer:** the fan has no "cancel timer" command, so this sends nothing. Turning the fan off
+  ends a running timer.
+- The preset also follows timers pressed on the physical remote, keeps showing through a speed
+  change (the fan keeps its timer), and returns to `No timer` when the fan turns off by any means.
+- When a timer is sent, the `QuietCool Remote` event entity fires the same `timer_Nh` and speed
+  events a remote timer press does, so Climate Advisor and your own automations see it the same way.
+- This device does not count down or report time remaining. To show a countdown in Home Assistant,
+  see [docs/ha-timer-countdown.md](docs/ha-timer-countdown.md).
 
 ## Troubleshooting
 
@@ -148,7 +186,7 @@ Two states are kept apart: what the *remote last announced* (changed only by rem
 by this device's own commands -- the remote cannot hear them) and the *fan entity*. A remote message
 moves the entity only when it changes what the remote announced:
 
-- **Off:** a confirmed `0x80` / `0xB0` that is a change, or the `0x80` Off action heard again (twice,
+- **Off:** a confirmed `0x80` / `0xB0` (or, with `remote_type: legacy`, `0x90`) that is a change, or the `0x80` Off action heard again (twice,
   or once followed by `0xB0` within 0.4 s, since its first copy is often corrupted) while the entity
   is on. A repeated `0xB0` status on its own never moves it.
 - **On:** a confirmed `0xBF`, *or any confirmed speed or timer byte* (`0x1F`/`0x3F`,
@@ -222,7 +260,9 @@ a `text_sensor.quietcool_speed` reporting the firmware's already-internally-trac
 speed as a continuously-readable *state*. It's fed from the same speed-context bit embedded in
 every status-beacon byte (speed, timer, AND power families — see the packet-format table above),
 not just explicit speed-select presses, so it stays accurate across a whole session even if the
-user never presses a dedicated speed button. Purely additive: zero change to the event entity's
+user never presses a dedicated speed button. It also follows the speed this device itself commands
+(a turn-on, speed change or timer from Home Assistant or Climate Advisor), so it shows the fan's
+current speed whichever side set it. Purely additive: zero change to the event entity's
 schema or semantics. See [docs/remote-capture-protocol.md](docs/remote-capture-protocol.md) for
 why a separate entity was chosen over overloading the event stream.
 
