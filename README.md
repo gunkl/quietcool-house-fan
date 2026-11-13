@@ -87,8 +87,14 @@ speed. The fan runs the timer itself, exactly as with the remote's timer button.
   ends a running timer.
 - The preset also follows timers pressed on the physical remote, keeps showing through a speed
   change (the fan keeps its timer), and returns to `No timer` when the fan turns off by any means.
-- When a timer is sent, the `QuietCool Remote` event entity fires the same `timer_Nh` and speed
-  events a remote timer press does, so Climate Advisor and your own automations see it the same way.
+- When a timer is sent, the `QuietCool Remote` event entity fires `timer_Nh` (the same event a remote
+  timer press fires) followed by the speed it was sent at (`low`/`high`), so Climate Advisor and
+  your own automations see the timer and its speed.
+- Picking the preset that is already shown does nothing (Home Assistant only reports a change); pick
+  another one, or turn the fan off and on, to send it again.
+- `legacy` remotes: an Off pressed at LOW is seen when the remote last reported the fan on (or
+  through a timer/speed press); if the remote itself still reports "off" while Home Assistant had
+  started the fan, that press is not visible (the `0x90` status is also what a plain wake repeats).
 - This device does not count down or report time remaining. To show a countdown in Home Assistant,
   see [docs/ha-timer-countdown.md](docs/ha-timer-countdown.md).
 

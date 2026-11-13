@@ -114,6 +114,11 @@ esphome:
                         (${legacy_code_speed_high}) >= 0 && (${legacy_code_speed_high}) <= 0xFF &&
                         (${legacy_code_off_status_low}) >= 0 && (${legacy_code_off_status_low}) <= 0xFF,
                         "every *_code_* substitution must be one byte (0x00-0xFF)");
+          static_assert(std::initializer_list<int>{${glass_codes_timer_low}}.size() == 5 &&
+                        std::initializer_list<int>{${glass_codes_timer_high}}.size() == 5 &&
+                        std::initializer_list<int>{${legacy_codes_timer_low}}.size() == 5 &&
+                        std::initializer_list<int>{${legacy_codes_timer_high}}.size() == 5,
+                        "every *_codes_timer_* substitution must list exactly 5 codes (1h, 2h, 4h, 8h, 12h)");
           // Issue #9/#10: while OFF, the fan entity's speed field holds fan_default_speed (see
           // on_turn_off below). Re-apply it here, right after restore, so the next plain turn-on
           // uses the configured default. This covers a fresh install, a device upgraded from an
@@ -1156,10 +1161,10 @@ script:
                   ESP_LOGI("quietcool-fan", "Timer %dh picked while the fan was off: no turn-on within 30 s -- cleared",
                            id(pending_ha_timer_hours));
                   id(pending_ha_timer_hours) = 0;
-                  if (!id(house_fan).state) {
-                    id(timer_preset_hours) = 0;
-                    id(refresh_timer_preset)->execute();
-                  }
+                  // Cleared even if the fan came on meanwhile from the remote or the power reading:
+                  // the held timer was never sent, so the preset must not keep showing it.
+                  id(timer_preset_hours) = 0;
+                  id(refresh_timer_preset)->execute();
                 }
                 if (!id(power_entity_present)) {
                   if (id(timer_armed) && (int32_t) (now_ms - id(timer_deadline_ms)) >= 0) {
@@ -1258,8 +1263,9 @@ script:
 
   # Transmit a timer (the fan must already be on) at the fan's current speed, exactly the code the
   # remote's timer button sends. The fan counts down on its own. Then:
-  #  - fire the SAME event-entity tokens a remote timer press produces (timer_Nh, then the speed), so
-  #    Climate Advisor sees an HA-set timer through its existing remote-event handling;
+  #  - fire the event entity's existing timer_Nh token (what a remote timer press fires), then the
+  #    speed it was sent at, so Climate Advisor's existing remote-event handling sees the timer and
+  #    its speed together (one burst). speed_state (what the REMOTE announced) is not touched;
   #  - start the existing remote-timer countdown (only without the power-entity package), so the
   #    fan entity goes off when the fan's timer ends;
   #  - show it as the fan entity's preset.
@@ -1380,10 +1386,13 @@ fan:
                 id(last_event_on) = true;
                 id(timer_armed) = false;
                 // A timer picked while the fan was off (ha_set_timer) goes out now, at this speed.
+                // If this turn-on carries a different preset of its own (fan.turn_on with
+                // preset_mode), that one wins: on_preset_set sends it next, so the held one is dropped.
                 if (id(pending_ha_timer_hours) != 0) {
                   int hours = id(pending_ha_timer_hours);
                   id(pending_ha_timer_hours) = 0;
-                  if ((millis() - id(pending_ha_timer_ms)) <= 30000UL) {
+                  std::string held = std::to_string(hours) + "h";
+                  if ((millis() - id(pending_ha_timer_ms)) <= 30000UL && id(house_fan).get_preset_mode() == held) {
                     id(send_timer)->execute(hours);
                   }
                 }
