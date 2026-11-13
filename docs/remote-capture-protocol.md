@@ -269,6 +269,173 @@ is the only explicit, authoritative power-down signal; receipt of *any* other ev
 `handle_remote_command` design should derive "the fan is on" from any non-off event, not wait
 specifically for an `"on"` token.
 
+## Fan entity state follows the remote (gunkl/ClimateAdvisor#1215, gunkl/ClimateAdvisor#449)
+
+**Problem.** The `house_fan` template fan only changed state for commands issued from HA. A remote
+start left it "off", so CA's `fan.turn_off` produced no on-to-off edge, `on_turn_off` never ran,
+and the RF off code (`0x80`) was never sent -- the fan kept running. CA's workaround
+(gunkl/ClimateAdvisor#449: send on, wait 5 s, send off) looped against a lagging power reading and
+restarted the fan 29 times in 2 minutes (gunkl/ClimateAdvisor#1215).
+
+### Two separate states
+
+* **(a) What the remote last announced**, per field: `power_state` / `speed_state` / `timer_state`.
+  They change ONLY when remote packets confirm a new value. This device's own transmissions never
+  touch them -- the physical remote never hears us, so after CA starts the fan the remote still holds
+  whatever it last said. (An earlier draft overwrote `power_state` with CA's commands; the remote's
+  next plain wake, re-sending its stale value, then looked like a brand-new press and flipped the
+  entity against the running fan, with a false `off` event.) `remote_power` is (a)'s power view
+  including what speed/timer bytes imply (0 unknown, 1 on, 2 off). It is **persisted across
+  reboots** (the held per-field values are not, exactly as before, because they feed the events).
+* **(b) The fan's actual state**: the `house_fan` entity.
+
+A remote message changes (b) only when it changes (a): a real press.
+
+### The rule (`remote_hint` script)
+
+"Changed" means the byte reached its field's confirm block with a previous held value. The **first
+confirmation of a field after boot** (previous value 0) is treated as *unchanged* for the entity:
+after an ESP reboot the remote's next plain wake re-sends its stale status, which must not look like
+a press. (The HA event for it fires exactly as before.)
+
+* **CHANGED on-byte** (`0xBF`, a speed byte, any timer-family byte `0x9_`/`0xA_`/`0xB_` incl.
+  `0x9F`): the entity goes on (speed from the byte: `0x9_`/`0x1F` LOW, `0xB_`/`0x3F`/`0xBF` HIGH,
+  `0xA_`/`0x2F` speculative -> HIGH on this 2-speed fan), or its speed follows if already on.
+  `0xBF` is "timer=none, speed=high", not a dedicated power press (see the `0x20` finding above), and
+  "off, then timer_1h" (2026-11-01 15:03:54) sends no `0xBF`.
+* **UNCHANGED on-byte** (a re-press of what the remote already holds, or a wake repeating it): first
+  it must be a fresh interaction (a `0x66` wake, or the first packet after >3 s of silence, valid
+  2.5 s) heard twice within 1.5 s. Then the entity goes on only if it is off AND the remote has
+  *announced* OFF (`remote_power == 2`). If the remote still holds "on" (CA stopped the fan behind
+  its back), or has announced nothing yet (`remote_power == 0`, e.g. the first boot after flashing),
+  it is indistinguishable from a plain wake re-sending stale status, so it changes nothing.
+* **CHANGED off-byte** (`0x80`/`0xB0` differing from the held power value): the entity goes off.
+* **UNCHANGED off-byte:** `0xB0` (the status beacon a wake re-sends) **never** moves the entity.
+  `0x80` (the action byte, sent only when Off is pressed) heard twice while the entity is on counts
+  as an off press regardless of `remote_power` (outside 500 ms after our own transmission). Because
+  the first `0x80` copy is often corrupted, one `0x80` followed by a `0xB0` within 400 ms
+  (`SAME_BURST_TOLERANCE_MS`) counts too: `0xB0` only ever COMPLETES a pending `0x80`, it never
+  starts one, so a lone stale-wake `0xB0` still does nothing. This closes "CA on, remote held off,
+  remote off pressed" and a second off after "off, timer_1h".
+* While the entity is on, only a CHANGED byte updates its speed; the speed it now runs at is also
+  recorded as `commanded_speed`, so a later HA speed change back to the last value *we* transmitted
+  is not swallowed.
+
+### What does a plain wake send? The document disagrees with itself
+
+The "Power / On" row at the top (line 12) says a wake from off with no button pressed sent `0xBF`
+(default on/high/no-timer, 5 clean readings). The "Power / Off" row (line 13) says `0xB0` appears
+"independently on a later plain wake-up with no fresh press". Both are captures; they probably
+describe different remote states (a remote that really powers the fan on at wake vs. one already
+announcing off). The two-state design makes the question moot: whichever byte a wake sends is
+compared with (a). A wake repeating (a) changes nothing, and an unchanged `0xB0` can never move the
+entity. A wake that sends a DIFFERENT power value (`0xBF` after an off) is a genuine change of (a),
+and that `0xBF` really did reach the fan, so following it is correct.
+
+### Echo (fixed list of our own bytes, 2 s)
+
+Our sends are several bytes (`0xBF`, then a speed byte). The old guard remembered only the LAST byte
+for 500 ms; production (gunkl/ClimateAdvisor#1215) showed a `low` event 15:04:16.5, ~1.05 s after CA's
+`0xBF`+`0x1F`, that passed it and changed `speed_state`; a late `0xBF` echo would have recreated the
+overwritten-state blocker. `sent_cmds` now keeps every byte we sent (ring of 8) and any received
+packet equal to one of them within 2 s is dropped before decode. **Event change versus `main`:** a
+genuine remote press of the same byte within 2 s of our own transmission of it is dropped too, and
+self-echoes no longer fire `event.quietcool_remote`. CA already ignores them. No other token changes.
+Because echoes are dropped before decode, no extra "ignore the remote after we transmit" blackout is
+needed for learning: a real press 1 s after a CA command is seen. The only retained quiet period is
+500 ms for the unchanged-`0x80` path (it overrides `remote_power`, so it is the one path where a
+corrupted echo would matter).
+
+### Power entity (ground truth, but it lags) -- opt-in `power-entity.yaml`
+
+Add `power-entity.yaml` next to `component.yaml` and set `power_entity` (an HA entity reporting
+on/off). It imports the entity as a text sensor (a binary_sensor import silently keeps its last
+value on "unavailable"/"unknown"; as text those states are read as "no reading" and ignored).
+
+Measured lag (production, gunkl/ClimateAdvisor#1215): ON 9.4 s after the remote `timer_1h` at
+15:03:54.8 (reading on at 15:04:04.2) and **14.0 s** for the 15:07:07.8 press (on at 15:07:21.85,
+no CA command in between); OFF about 15.5 s. The earlier "~5.5 s" on-figure was a still-spinning fan
+restarting, not a cold start. Defaults: `power_on_lag_s` 20 (14.0 s + ~40 %), `power_off_lag_s` 25,
+`power_hard_timeout_s` 90.
+
+* Inside the lag window after the last remote press or our own transmission, the entity follows
+  that event and the reading cannot override it.
+* After the window the reading wins. **After an ON event it must also have CHANGED since the
+  event** (a slow spin-up still reading "off" can never flip an entity the user just turned on), or
+  the hard timeout must have passed. **After an OFF event no such hold applies**: if CA's RF off was
+  lost in a sealed house the fan keeps running and the reading stays on, and holding the entity
+  "off" for the hard timeout would swallow every CA `turn_off` retry; a wrongly-ON entity only
+  blocks `turn_on`, the cheaper failure. On a disagreement the entity is set to match (no transmit)
+  and a warning logged.
+* With no event at all (timer ran out, wall switch, power cut, boot) the reading wins once it has
+  held ~2 s.
+* "unavailable"/"unknown" readings are ignored, and coming back with the SAME value does not count
+  as a change (it must not win the spin-up hold). Nothing is reconciled unless a Home Assistant
+  client with a state subscription is connected (`is_connected_with_state_subscription()`, so a
+  log-viewer client does not count): the text sensor does not clear itself on disconnect, so its last
+  value would otherwise be trusted indefinitely.
+* The power entity is ground truth (David's decision), so it must be kept accurate. An
+  `input_boolean` never goes unavailable, so a wrong or removed id would just never report: 60 s
+  after HA connects with no reading the firmware logs `power entity <id> sends no state; check the
+  entity id`. A missing `power_entity` fails validation with "Entity ID must have exactly one dot"
+  and the placeholder `SET_power_entity_in_your_substitutions`.
+* Without the package, on a confirmed `timer_Nh` the entity is mirrored off after N hours. The
+  countdown follows the timer field: a new duration arms/re-arms it, and so does the same duration
+  when the timer is started after an off or on an entity that reads off (`0xB1` held, off, `0x91`);
+  "no timer" or any power change cancels it; a speed-family-only change while running (e.g. `0x91`
+  -> `0xB1`, same duration) and speed-field presses leave it alone; an unchanged fresh re-press
+  re-arms it only if a countdown is already running or that same press turns the entity on (so a
+  stale wake re-sending `0x91` after the timer expired and CA restarted the fan cannot arm one);
+  our own transmission cancels it. It lives in RAM and is not persisted across a reboot. It is a
+  fallback only.
+
+### Cost of being wrong (corrected)
+
+A wrongly-OFF entity blocks CA's `turn_off` (no transition, nothing sent): the original bug. A
+wrongly-ON entity is not harmless either: CA's `turn_off` still transmits (a stop sent to a stopped
+fan), but CA's `turn_on` becomes a no-op because there is no off-to-on edge, so CA cannot restart
+the fan. With the power entity the reading corrects both directions after the lag window.
+
+### Impact on Climate Advisor
+
+* `fan.turn_off` after a remote start now transmits `0x80` (the entity reads "on"), so the "on, wait
+  5 s, off" workaround (gunkl/ClimateAdvisor#449) can be removed.
+* `event.quietcool_remote` tokens are unchanged except that our own echoes (any byte we sent in the
+  last 2 s) no longer fire events; CA already ignored them.
+* With the power package, the entity can change with no remote press and no CA command (timer
+  ran out, wall switch, power cut, or a correction after the lag window): CA should treat the
+  entity as the fan's real state. After a lost RF off the entity returns to "on" once
+  `power_off_lag_s` (25 s) has passed, so CA's retry is a real transition.
+* Without the package, CA may still see a wrongly-on entity (gap cases in the table below):
+  its `turn_off` then transmits harmlessly, but its `turn_on` is a no-op until the entity is
+  corrected.
+
+### Sequences (entity result; "PE" = power-entity package in use)
+
+| # | Sequence | Without PE | With PE |
+|---|---|---|---|
+| a | off, then `timer_1h` 4 s later (LOW, `0x91`) | Off confirms: entity off. Timer byte differs from held `timer_state`: entity on LOW, 1 h countdown armed. Same byte already held: counts only as a fresh re-press (4 s > 3 s silence, or a wake) heard twice, which also re-arms the countdown; inside the off beacon it is missed. | Same; the reading rises 9-14 s later and agrees. If missed, the reading corrects it after the off lag window, once it has changed. |
+| b | same at HIGH (`0xB1`) | As (a), speed HIGH. | As (a). |
+| c | wake + unchanged held speed byte | Entity on: nothing. Entity off and remote last said on: nothing. Remote last said off: fresh re-press twice -> on. | Same; the reading is authoritative afterwards. |
+| d | off burst + trailing `0x80`/`0xB0` | 2nd `0x80` confirms: entity off, `off` event as on `main`, fresh marker cleared; the rest are unchanged (entity already off, nothing to do). | Same; reading falls ~15.5 s later. |
+| e | CA `turn_on`, then remote off (remote held off) | Unchanged `0x80` heard twice while the entity is on: entity off. | Same; reading agrees. |
+| f | CA `turn_off` | Entity off, `0x80` sent, countdown cancelled, (a) untouched. | Same; reading agrees ~15.5 s later. |
+| g | boot | `booted_up` false for 2 s: no transmit; entity per `restore_mode`. | After 2 s stable the reading wins over the restored state, no transmit. |
+| h | receiver hears its own packet (any byte we sent, up to 2 s) | Dropped before decode: no event, (a) untouched. | Same. |
+| i | CA starts fan, then a plain wake (the stale `0xB0`) | Unchanged `0xB0`: ignored, entity stays on, no `off` event. | Same; reading agrees. |
+| j | remote timer expires by itself | Countdown mirrors off after N h. | Reading drops with no recent event: followed after 2 s. |
+| k | wall-switch off | Not detectable; entity stays on (CA `turn_on` blocked). | Reading drops: entity off. |
+| l | off, `timer_1h`, timer expires, CA restarts the fan, plain wake re-sends `0xB0` | Countdown turned the entity off; CA's on set it on; the unchanged `0xB0` is ignored. | Same; the reading follows the real fan. |
+| m | CA `turn_on`, remote spin-up slow: reading still off at +25 s | n/a | Entity stays on until the reading changes or 90 s pass; it never flips during spin-up. |
+| n | CA `turn_off` then CA `turn_on` right after a remote speed mirror | `commanded_speed` follows the mirrored speed, so an HA speed change back to the old value transmits. | Same. |
+| s1 | CA `turn_off`, RF lost in a sealed house, fan keeps running | n/a | Off lag (25 s) passes; the reading still says on; the entity is corrected to on at once (no 90 s hold after an off event), so CA's retry `turn_off` is a real transition and transmits again. |
+| s2 | timer expires, CA restarts the fan, a plain wake re-sends `0x91` | Unchanged re-press with no countdown running and the entity already on: nothing arms. | n/a |
+| s3 | `0xB1` held, off, then `0x91` | Entity off; `0x91` has the same duration as the held one but the entity was off, so it counts as a new start: entity on and the countdown arms. | Entity on; reading follows. |
+| s4 | off press whose first `0x80` copy is corrupted: `0x80`, `0xB0` within 400 ms | One `0x80` plus the `0xB0` completes it: entity off. | Same. |
+| s5 | first boot after flashing (`remote_power` 0), stale wake | Needs `remote_power == 2`: nothing happens. | Reading is authoritative. |
+| r1 | reboot, then the remote's stale plain wake (re-sends its last status) | First confirmation since boot is "unchanged"; `remote_power` persisted: stale "on" speed with the remote last saying on is ignored; stale `0xB0` is ignored. | Same; reading is authoritative. |
+| r2 | reboot, then a real press | First confirmation counts as unchanged, so it needs a fresh interaction heard twice and `remote_power == 2`; a second press, or a changed field after the first, is a normal change. Residual: the very first press after boot of a value while the remote last said "on" is missed. | The reading corrects it after the lag window. |
+
 ## Ambient speed sensor: a separate entity, not a companion event (Climate Advisor speed-aware remote)
 
 Climate Advisor wanted to detect and respect the remote's speed selection, not just react to
