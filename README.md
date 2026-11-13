@@ -62,6 +62,8 @@ understands:
 
 | | `glass` (default) | `legacy` |
 |---|---|---|
+| Remote | <img src="images/remote-glass.png" alt="QuietCool glass remote: a touch-glass panel with three round buttons down the centre (timer, on/off, speed H M L)" width="200"> | <img src="images/remote-legacy.png" alt="QuietCool legacy remote: a wall plate with a single rocker-style button, timer lights 1 2 4 8 12 above and speed lights H M L at the side" width="200"> |
+| Looks like | Touch-glass panel, three round buttons down the centre (timer, on/off, speed) | Wall plate with one large button, timer lights across the top and H/M/L speed lights at the side |
 | Which fans | The touch-glass remote this component was built and tested on | An older remote/fan, contributed in [#14](https://github.com/gunkl/quietcool-house-fan/pull/14) |
 | Turn on at LOW / HIGH | `0xBF` then `0x1F` / `0xBF` then `0x3F` | `0x9F` / `0xBF` (one byte) |
 | Off, speed change | `0x80`; `0x1F` / `0x3F` | same |
