@@ -47,6 +47,10 @@ substitutions:
   #   *_codes_timer_low/high     timer at LOW / HIGH speed, in the order 1h, 2h, 4h, 8h, 12h
   #   *_code_off_status_low      "off" status the remote reports at LOW ("0x00" = none; such a
   #                              remote reports off as 0x80/0xB0 at any speed)
+  #   *_timer_starts_fan         "true": a timer code alone starts a stopped fan (the remote's own
+  #                              "off, then timer" sends only the timer code), so a timer picked in
+  #                              HA while the fan is off is sent at once. "false": it is held 30 s
+  #                              for a turn-on from HA instead.
   glass_code_turn_on_low: "0xbf"
   glass_code_turn_on_high: "0xbf"
   glass_turn_on_sends_speed: "true"
@@ -56,6 +60,7 @@ substitutions:
   glass_codes_timer_low: "0x91, 0x92, 0x94, 0x98, 0x9c"
   glass_codes_timer_high: "0xb1, 0xb2, 0xb4, 0xb8, 0xbc"
   glass_code_off_status_low: "0x00"
+  glass_timer_starts_fan: "false"
   legacy_code_turn_on_low: "0x9f"
   legacy_code_turn_on_high: "0xbf"
   legacy_turn_on_sends_speed: "false"
@@ -65,6 +70,9 @@ substitutions:
   legacy_codes_timer_low: "0x91, 0x92, 0x94, 0x98, 0x9c"
   legacy_codes_timer_high: "0xb1, 0xb2, 0xb4, 0xb8, 0xbc"
   legacy_code_off_status_low: "0x90"
+  # Confirmed on a legacy remote: off, then the 1h timer button sends wake (0x66) then only 0x91,
+  # and the fan starts at LOW with a 1 h timer.
+  legacy_timer_starts_fan: "true"
   # Tuning for the OPTIONAL power-entity package (power-entity.yaml, see README); harmless defaults
   # otherwise. The power reading lags a real change. Measured (gunkl/ClimateAdvisor#1215 production
   # logs): ON up to 14.0 s after a remote timer press (9.4 s on another; an earlier ~5.5 s figure was
@@ -172,6 +180,10 @@ globals:
     type: std::array<uint8_t, 5>
     restore_value: false
     initial_value: '(std::string_view("${remote_type}") == "legacy") ? std::array<uint8_t, 5>{${legacy_codes_timer_high}} : std::array<uint8_t, 5>{${glass_codes_timer_high}}'
+  - id: timer_starts_fan
+    type: bool
+    restore_value: false
+    initial_value: '(std::string_view("${remote_type}") == "legacy") ? (${legacy_timer_starts_fan}) : (${glass_timer_starts_fan})'
   - id: code_off_status_low # 0 = this remote has no separate off-at-LOW status byte
     type: uint8_t
     restore_value: false
@@ -1228,9 +1240,10 @@ script:
 
   # A timer preset picked in Home Assistant (on_preset_set). hours: 1/2/4/8/12, 0 = "No timer".
   #  - Fan on: send it now, at the fan's current speed (send_timer).
-  #  - Fan off: send nothing (a timer code would start the fan). Hold it for 30 s; the next
-  #    turn-on from HA sends it right after the turn-on (on_turn_on). Otherwise it is cleared
-  #    (reconcile_loop).
+  #  - Fan off, timer_starts_fan (legacy): send the timer code alone, exactly as the remote does
+  #    for "off, then timer"; it starts the fan at the default speed (start_fan_with_timer).
+  #  - Fan off, otherwise: send nothing. Hold it for 30 s; the next turn-on from HA sends it right
+  #    after the turn-on (on_turn_on). Otherwise it is cleared (reconcile_loop).
   #  - "No timer": the fan has no cancel command, so nothing is sent. It only clears the preset
   #    shown and any held timer; turning the fan off ends a running timer.
   - id: ha_set_timer
@@ -1251,6 +1264,10 @@ script:
             id(refresh_timer_preset)->execute();
             return;
           }
+          if (!id(house_fan).state && id(timer_starts_fan)) {
+            id(start_fan_with_timer)->execute(hours);
+            return;
+          }
           if (!id(house_fan).state) {
             ESP_LOGI("quietcool-fan", "Timer %dh picked while the fan is off -- held 30 s for a turn-on", hours);
             id(pending_ha_timer_hours) = hours;
@@ -1259,6 +1276,28 @@ script:
             id(refresh_timer_preset)->execute();
             return;
           }
+          id(send_timer)->execute(hours);
+
+  # Start a stopped fan with a timer, the way the remote does (remote_type legacy, timer_starts_fan):
+  # the timer code alone, at the speed a plain turn-on would use (the speed field holds it while
+  # off). The entity is mirrored on WITHOUT running on_turn_on, which would send a turn-on byte too.
+  # Deferred one loop (delay 0): this is reached from on_preset_set, inside the fan's own state
+  # update, and mirroring the entity on publishes the fan state again.
+  - id: start_fan_with_timer
+    mode: restart
+    parameters:
+      hours: int
+    then:
+      - delay: 0ms
+      - lambda: |-
+          if (id(house_fan).state) {   // turned on meanwhile: just send the timer
+            id(send_timer)->execute(hours);
+            return;
+          }
+          int level = id(house_fan).speed >= 2 ? 2 : 1;
+          ESP_LOGI("quietcool-fan", "Timer %dh picked while the fan is off -- starting it with the timer code", hours);
+          id(pending_ha_timer_hours) = 0;
+          id(sync_fan_from_remote)->execute(1, level, true);
           id(send_timer)->execute(hours);
 
   # Transmit a timer (the fan must already be on) at the fan's current speed, exactly the code the
