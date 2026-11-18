@@ -82,9 +82,12 @@ fan's more-info dialog, or add the **Fan preset modes** feature to a Tile card n
 speed. The fan runs the timer itself, exactly as with the remote's timer button.
 
 - **Fan on:** the timer is sent right away, at the fan's current speed.
-- **Fan off:** nothing is sent (a timer code would start the fan). The choice is held for 30 s: turn
-  the fan on from Home Assistant within that time and the timer is sent right after the turn-on, at
-  that speed. Otherwise it is cleared.
+- **Fan off, `legacy` remote:** the timer code alone is sent, exactly what the remote sends for
+  "off, then timer": it starts the fan at the default "on" speed with that timer.
+- **Fan off, `glass` remote:** nothing is sent. The choice is held for 30 s: turn the fan on from
+  Home Assistant within that time and the timer is sent right after the turn-on, at that speed.
+  Otherwise it is cleared. (Set `glass_timer_starts_fan: "true"` to send it at once instead, if your
+  glass fan also starts from a timer code alone.)
 - **No timer:** the fan has no "cancel timer" command, so this sends nothing. Turning the fan off
   ends a running timer.
 - The preset also follows timers pressed on the physical remote, keeps showing through a speed
